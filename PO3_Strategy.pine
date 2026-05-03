@@ -1,319 +1,378 @@
 // This source code is subject to the terms of the Mozilla Public License 2.0
 // © rpmnode
+//
+// ══════════════════════════════════════════════════════════════════════════════
+//  AUTO TV PO3 — BTC/USDC 4H · Flujo Institucional
+//  Power of 3: Acumulación → Manipulación (absorción de liquidez) → Distribución
+// ══════════════════════════════════════════════════════════════════════════════
+//
+//  CONFIGURACIÓN WUNDERTRADING → TRADINGVIEW → BINANCE
+//  ────────────────────────────────────────────────────
+//  1. WunderTrading → Mis Bots → Nuevo Bot → Binance Spot → BTC/USDC
+//  2. Copia el "Bot Secret Key" → pégalo en el input "WT Bot Secret Key"
+//  3. TradingView → Alertas → Nueva alerta sobre este script
+//       · Condición : PO3 4H BTC — cualquier alerta
+//       · Mensaje   : {{strategy.order.alert_message}}
+//       · Webhook   : https://wundertrading.com/api/v1/bots/{TU_BOT_ID}/signals
+//  4. Guarda y activa la alerta — WunderTrading ejecutará en Binance automáticamente
+//
+// ══════════════════════════════════════════════════════════════════════════════
 
 //@version=5
 strategy(
-     title        = "AUTO TV PO3 — Power of 3 Algo",
-     shorttitle   = "PO3 Algo",
-     overlay      = true,
-     margin_long  = 100,
-     margin_short = 100,
-     default_qty_type  = strategy.percent_of_equity,
-     default_qty_value = 2,
-     initial_capital   = 10000,
-     commission_type   = strategy.commission.percent,
-     commission_value  = 0.05,
-     slippage          = 1
+     title                  = "AUTO TV PO3 — BTC/USDC 4H Institucional",
+     shorttitle             = "PO3 4H BTC",
+     overlay                = true,
+     pyramiding             = 0,
+     default_qty_type       = strategy.percent_of_equity,
+     default_qty_value      = 100,
+     initial_capital        = 10000,
+     commission_type        = strategy.commission.percent,
+     commission_value       = 0.05,
+     slippage               = 2
      )
 
 // ─────────────────────────────────────────────────────────────────────────────
 // INPUTS
 // ─────────────────────────────────────────────────────────────────────────────
 
-var GRP_SESSIONS = "Sessions"
-asian_open  = input.session("0000-0800", "Asian Session",   group = GRP_SESSIONS)
-london_open = input.session("0800-1200", "London Session",  group = GRP_SESSIONS)
-ny_open     = input.session("1200-2000", "NY Session",      group = GRP_SESSIONS)
-timezone    = input.string("UTC", "Timezone",               group = GRP_SESSIONS)
+var G1 = "⚡ WunderTrading"
+wt_key       = input.string("TU_BOT_SECRET_KEY",  "Bot Secret Key",           group = G1,
+                             tooltip = "Pega aquí el Secret Key del bot de WunderTrading.\nATENCIÓN: no compartas el gráfico público con esta clave visible.")
+wt_amount    = input.float(100.0, "% Capital por operación",  minval = 1, maxval = 100, step = 1, group = G1)
 
-var GRP_PO3 = "Power of 3"
-sweep_pct   = input.float(0.1,  "Sweep Buffer (%)", minval = 0.0, step = 0.05, group = GRP_PO3,
-                          tooltip = "How far price must close beyond the Asian range to confirm manipulation.")
-fvg_min_pct = input.float(0.05, "Min FVG Size (%)", minval = 0.0, step = 0.01, group = GRP_PO3,
-                          tooltip = "Minimum gap size (as % of price) to qualify as a Fair Value Gap.")
-ob_lookback = input.int(3, "Order Block Lookback (bars)", minval = 1, maxval = 10, group = GRP_PO3)
+var G2 = "💧 Pools de Liquidez"
+use_pdhl     = input.bool(true,  "PDH / PDL  (máx/mín día anterior)",    group = G2)
+use_pwhl     = input.bool(true,  "PWH / PWL  (máx/mín semana anterior)", group = G2)
+use_eqhl     = input.bool(true,  "EQH / EQL  (máximos/mínimos iguales)", group = G2)
+eq_look      = input.int(10,     "  · Lookback EQH/EQL (barras 4H)",     group = G2, minval = 3, maxval = 50)
+eq_tol       = input.float(0.15, "  · Tolerancia EQH/EQL (%)",           group = G2, minval = 0.01, step = 0.01)
 
-var GRP_RISK = "Risk Management"
-rr_ratio    = input.float(2.0,  "Risk : Reward",      minval = 0.5,  step = 0.5,  group = GRP_RISK)
-sl_buffer   = input.float(0.05, "SL Buffer (%)",      minval = 0.0,  step = 0.01, group = GRP_RISK,
-                          tooltip = "Extra buffer added beyond the manipulation wick for the stop loss.")
-max_trades  = input.int(1,   "Max Trades / Session",  minval = 1,    maxval = 5,  group = GRP_RISK)
-trade_sess  = input.string("London + NY", "Trade During",
-                           options = ["London Only", "NY Only", "London + NY"], group = GRP_RISK)
+var G3 = "🏦 Absorción Institucional"
+vol_mult     = input.float(1.5,  "Multiplicador de volumen (sweep)",  group = G3, minval = 1.0, step = 0.1,
+                            tooltip = "El volumen del sweep debe superar N × la media para confirmar absorción institucional.")
+vol_len      = input.int(20,     "Período media de volumen",          group = G3, minval = 5, maxval = 100)
+wick_min_pct = input.float(0.20, "Wick mínimo del sweep (%)",         group = G3, minval = 0.0, step = 0.05,
+                            tooltip = "La mecha de la vela debe superar este % del precio para validar el stop hunt.")
 
-var GRP_DISPLAY = "Display"
-show_asian  = input.bool(true, "Show Asian Range",    group = GRP_DISPLAY)
-show_fvg    = input.bool(true, "Show FVGs",           group = GRP_DISPLAY)
-show_ob     = input.bool(true, "Show Order Blocks",   group = GRP_DISPLAY)
-show_labels = input.bool(true, "Show Signal Labels",  group = GRP_DISPLAY)
+var G4 = "🎯 Confluencia OB / FVG"
+use_ob       = input.bool(true,  "Filtro Order Block",                group = G4)
+use_fvg      = input.bool(true,  "Filtro Fair Value Gap",             group = G4)
+need_conf    = input.bool(false, "Exigir confluencia para la entrada", group = G4,
+                           tooltip = "Si está activo, sólo entra cuando el precio está dentro de un OB o FVG válido.")
+ob_look      = input.int(3,      "  · Lookback Order Block (barras)", group = G4, minval = 1, maxval = 10)
+fvg_min_pct  = input.float(0.05, "  · FVG mínimo (%)",               group = G4, minval = 0.0, step = 0.01)
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SESSION DETECTION
-// ─────────────────────────────────────────────────────────────────────────────
+var G5 = "🛡️ Gestión de Riesgo"
+rr           = input.float(2.5,  "Risk : Reward",           group = G5, minval = 0.5, step = 0.5)
+sl_buf_pct   = input.float(0.10, "Buffer SL sobre el wick (%)", group = G5, minval = 0.0, step = 0.05)
+max_day_tr   = input.int(2,      "Máx. entradas por día",    group = G5, minval = 1, maxval = 5)
 
-in_asian  = not na(time(timeframe.period, asian_open,  timezone))
-in_london = not na(time(timeframe.period, london_open, timezone))
-in_ny     = not na(time(timeframe.period, ny_open,     timezone))
-
-in_trade_session = switch trade_sess
-    "London Only"   => in_london
-    "NY Only"       => in_ny
-    => in_london or in_ny  // London + NY
-
-// Detect session transitions
-asian_started  = in_asian  and not in_asian[1]
-asian_ended    = not in_asian and in_asian[1]
-london_started = in_london and not in_london[1]
-ny_started     = in_ny and not in_ny[1]
+var G6 = "🎨 Visual"
+show_lvl     = input.bool(true, "Niveles de liquidez",     group = G6)
+show_lbl     = input.bool(true, "Etiquetas de señal",      group = G6)
+show_fvg_bg  = input.bool(true, "Zonas FVG",               group = G6)
+show_ob_box  = input.bool(true, "Cajas Order Block",       group = G6)
+show_sweep   = input.bool(true, "Marcar sweeps",           group = G6)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ASIAN RANGE — ACCUMULATION PHASE
+// FUNCIONES AUXILIARES
 // ─────────────────────────────────────────────────────────────────────────────
 
-var float asian_hi   = na
-var float asian_lo   = na
-var float asian_mid  = na
-var bool  asian_set  = false
-var int   daily_trades = 0
-
-// Reset at start of each Asian session
-if asian_started
-    asian_hi     := high
-    asian_lo     := low
-    asian_set    := false
-    daily_trades := 0
-
-// Build range during Asian session
-if in_asian
-    asian_hi := math.max(asian_hi, high)
-    asian_lo := math.min(asian_lo, low)
-
-// Lock range when Asian session ends
-if asian_ended
-    asian_mid := math.avg(asian_hi, asian_lo)
-    asian_set := true
+pct(p, x) => p * x / 100
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FAIR VALUE GAP DETECTION
+// NIVELES DE LIQUIDEZ — ACUMULACIÓN
 // ─────────────────────────────────────────────────────────────────────────────
 
-fvg_min_size(p) => p * fvg_min_pct / 100
+// Previous Day High / Low  (con lookahead correcto usando [1] en la fuente)
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_on)
+pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead = barmerge.lookahead_on)
 
-// Bullish FVG: gap between candle[-2].high and candle[0].low (with middle candle body up)
-bull_fvg_top = high[2]
-bull_fvg_bot = low[0]
-bull_fvg     = close[1] > open[1] and low[0] > high[2] and
-               (low[0] - high[2]) >= fvg_min_size(close)
+// Previous Week High / Low
+pwh = request.security(syminfo.tickerid, "W", high[1], lookahead = barmerge.lookahead_on)
+pwl = request.security(syminfo.tickerid, "W", low[1],  lookahead = barmerge.lookahead_on)
 
-// Bearish FVG: gap between candle[-2].low and candle[0].high
-bear_fvg_bot = low[2]
-bear_fvg_top = high[0]
-bear_fvg     = close[1] < open[1] and high[0] < low[2] and
-               (low[2] - high[0]) >= fvg_min_size(close)
+// Equal Highs / Equal Lows — clusters de stops visible en el gráfico 4H
+var float eqh_level = na
+var float eql_level = na
+eqh_hit = false
+eql_hit = false
 
-// Track recent FVG levels (last unfilled)
-var float last_bull_fvg_top = na
-var float last_bull_fvg_bot = na
-var float last_bear_fvg_top = na
-var float last_bear_fvg_bot = na
-var bool  bull_fvg_filled   = true
-var bool  bear_fvg_filled   = true
-
-if bull_fvg
-    last_bull_fvg_top := bull_fvg_top
-    last_bull_fvg_bot := bull_fvg_bot
-    bull_fvg_filled   := false
-
-if bear_fvg
-    last_bear_fvg_top := bear_fvg_top
-    last_bear_fvg_bot := bear_fvg_bot
-    bear_fvg_filled   := false
-
-// Mark FVG as filled when price enters the gap zone
-if not bull_fvg_filled and low <= last_bull_fvg_top
-    bull_fvg_filled := true
-
-if not bear_fvg_filled and high >= last_bear_fvg_bot
-    bear_fvg_filled := true
+if use_eqhl
+    for i = 1 to eq_look
+        if math.abs(high - high[i]) <= pct(eq_tol, high)
+            eqh_hit   := true
+            eqh_level := math.max(high, high[i])
+        if math.abs(low - low[i]) <= pct(eq_tol, low)
+            eql_hit   := true
+            eql_level := math.min(low, low[i])
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ORDER BLOCK DETECTION
-// ─────────────────────────────────────────────────────────────────────────────
-// Bullish OB: last bearish candle before a strong bullish impulse
-// Bearish OB: last bullish candle before a strong bearish impulse
-
-is_bull_impulse = close > close[1] * 1.001 and close > open
-is_bear_impulse = close < close[1] * 0.999 and close < open
-
-var float bull_ob_hi = na
-var float bull_ob_lo = na
-var float bear_ob_hi = na
-var float bear_ob_lo = na
-var bool  bull_ob_mitigated = true
-var bool  bear_ob_mitigated = true
-
-// Bearish candle before bullish impulse → bullish OB
-if is_bull_impulse and close[ob_lookback] < open[ob_lookback]
-    bull_ob_hi       := open[ob_lookback]
-    bull_ob_lo       := close[ob_lookback]
-    bull_ob_mitigated := false
-
-// Bullish candle before bearish impulse → bearish OB
-if is_bear_impulse and close[ob_lookback] > open[ob_lookback]
-    bear_ob_hi       := close[ob_lookback]
-    bear_ob_lo       := open[ob_lookback]
-    bear_ob_mitigated := false
-
-// Mitigate when price trades through OB
-if not bull_ob_mitigated and low <= bull_ob_lo
-    bull_ob_mitigated := true
-
-if not bear_ob_mitigated and high >= bear_ob_hi
-    bear_ob_mitigated := true
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MANIPULATION (SWEEP) DETECTION — PO3 PHASE 2
+// VOLUMEN — DETECCIÓN DE ABSORCIÓN INSTITUCIONAL
 // ─────────────────────────────────────────────────────────────────────────────
 
-sweep_buf_pts(p) => p * sweep_pct / 100
-
-// Bullish sweep: price wicks below Asian low then closes above it → bearish manipulation (hunt stops below)
-bull_sweep = asian_set and not in_asian and
-             low < asian_lo - sweep_buf_pts(asian_lo) and
-             close > asian_lo
-
-// Bearish sweep: price wicks above Asian high then closes below it → bullish manipulation (hunt stops above)
-bear_sweep = asian_set and not in_asian and
-             high > asian_hi + sweep_buf_pts(asian_hi) and
-             close < asian_hi
+vol_avg   = ta.sma(volume, vol_len)
+inst_vol  = volume >= vol_avg * vol_mult   // volumen institucional confirmado
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ENTRY CONDITIONS — PO3 PHASE 3: DISTRIBUTION
+// SWEEP + ABSORCIÓN — MANIPULACIÓN (PO3 Fase 2)
 // ─────────────────────────────────────────────────────────────────────────────
-// After a sweep, look for confluence with OB or FVG to enter in the TRUE direction.
+// La institución sweepea el pool de liquidez para absorber las órdenes stop
+// retail y posicionarse. La señal: mecha supera el nivel → cierre vuelve dentro.
 
-can_trade = in_trade_session and asian_set and daily_trades < max_trades
+lower_wick = math.min(open, close) - low   // mecha inferior
+upper_wick = high - math.max(open, close)  // mecha superior
 
-// Long entry: bearish sweep (stop hunt below) → expect bullish distribution
-// Confluence: price near a bullish OB or unfilled bullish FVG
-long_ob_conf  = not bull_ob_mitigated and close >= bull_ob_lo and close <= bull_ob_hi
-long_fvg_conf = not bull_fvg_filled  and close >= last_bull_fvg_bot and close <= last_bull_fvg_top
+bull_wick_ok = lower_wick >= pct(wick_min_pct, low)
+bear_wick_ok = upper_wick >= pct(wick_min_pct, high)
 
-long_signal = can_trade and bull_sweep and (long_ob_conf or long_fvg_conf)
+// BULL sweep: stop hunt bajo un pool → institución absorbe vendedores y compra
+sweep_pdl = use_pdhl and low < pdl and close > pdl and bull_wick_ok
+sweep_pwl = use_pwhl and low < pwl and close > pwl and bull_wick_ok
+sweep_eql = use_eqhl and eql_hit and low < eql_level and close > eql_level and bull_wick_ok
 
-// Short entry: bullish sweep (stop hunt above) → expect bearish distribution
-// Confluence: price near a bearish OB or unfilled bearish FVG
-short_ob_conf  = not bear_ob_mitigated and close >= bear_ob_lo and close <= bear_ob_hi
-short_fvg_conf = not bear_fvg_filled  and close >= last_bear_fvg_bot and close <= last_bear_fvg_top
+// BEAR sweep: stop hunt sobre un pool → institución absorbe compradores y vende
+sweep_pdh = use_pdhl and high > pdh and close < pdh and bear_wick_ok
+sweep_pwh = use_pwhl and high > pwh and close < pwh and bear_wick_ok
+sweep_eqh = use_eqhl and eqh_hit and high > eqh_level and close < eqh_level and bear_wick_ok
 
-short_signal = can_trade and bear_sweep and (short_ob_conf or short_fvg_conf)
+bull_sweep = (sweep_pdl or sweep_pwl or sweep_eql) and inst_vol
+bear_sweep = (sweep_pdh or sweep_pwh or sweep_eqh) and inst_vol
 
-// ─────────────────────────────────────────────────────────────────────────────
-// STOP LOSS & TAKE PROFIT
-// ─────────────────────────────────────────────────────────────────────────────
-
-sl_buf_pts(p) => p * sl_buffer / 100
-
-long_sl  = low  - sl_buf_pts(low)          // below manipulation wick
-long_tp  = close + (close - long_sl) * rr_ratio
-
-short_sl = high + sl_buf_pts(high)         // above manipulation wick
-short_tp = close - (short_sl - close) * rr_ratio
+// Nivel sweepado (para SL y etiqueta)
+bull_swept_lvl = sweep_pdl ? pdl : sweep_pwl ? pwl : eql_level
+bear_swept_lvl = sweep_pdh ? pdh : sweep_pwh ? pwh : eqh_level
 
 // ─────────────────────────────────────────────────────────────────────────────
-// STRATEGY ORDERS
+// FAIR VALUE GAPS
 // ─────────────────────────────────────────────────────────────────────────────
 
-if long_signal and strategy.position_size == 0
-    strategy.entry("Long", strategy.long)
-    strategy.exit("Long Exit", "Long", stop = long_sl, limit = long_tp)
-    daily_trades += 1
+fvg_min_sz = pct(fvg_min_pct, close)
 
-if short_signal and strategy.position_size == 0
-    strategy.entry("Short", strategy.short)
-    strategy.exit("Short Exit", "Short", stop = short_sl, limit = short_tp)
-    daily_trades += 1
+// Bullish FVG: vela [1] alcista, hueco entre high[2] y low[0]
+bull_fvg_new = close[1] > open[1] and low > high[2] and (low - high[2]) >= fvg_min_sz
+// Bearish FVG: vela [1] bajista, hueco entre high[0] y low[2]
+bear_fvg_new = close[1] < open[1] and high < low[2] and (low[2] - high) >= fvg_min_sz
 
-// ─────────────────────────────────────────────────────────────────────────────
-// VISUALS
-// ─────────────────────────────────────────────────────────────────────────────
+var float bfvg_lo = na  // límite inferior del Bullish FVG
+var float bfvg_hi = na  // límite superior del Bullish FVG
+var float sfvg_lo = na  // límite inferior del Bearish FVG
+var float sfvg_hi = na  // límite superior del Bearish FVG
+var bool  bfvg_ok = false
+var bool  sfvg_ok = false
 
-// Asian Range box
-var box asian_box = na
-var line asian_mid_line = na
+if bull_fvg_new
+    bfvg_lo := high[2]
+    bfvg_hi := low
+    bfvg_ok := true
 
-if asian_ended and show_asian
-    box.delete(asian_box)
-    line.delete(asian_mid_line)
-    asian_box      := box.new(bar_index[1], asian_hi, bar_index + 50, asian_lo,
-                              border_color = color.new(color.yellow, 20),
-                              bgcolor      = color.new(color.yellow, 88),
-                              border_width = 1)
-    asian_mid_line := line.new(bar_index[1], asian_mid, bar_index + 50, asian_mid,
-                               color = color.new(color.yellow, 40),
-                               style = line.style_dashed,
-                               width = 1)
+if bear_fvg_new
+    sfvg_lo := high
+    sfvg_hi := low[2]
+    sfvg_ok := true
 
-// Extend Asian range box each bar while it exists
-if not in_asian and asian_set and show_asian
-    if not na(asian_box)
-        box.set_right(asian_box, bar_index + 5)
-    if not na(asian_mid_line)
-        line.set_x2(asian_mid_line, bar_index + 5)
-
-// FVG shading
-bgcolor_bull_fvg = show_fvg and bull_fvg ? color.new(color.green, 85) : na
-bgcolor_bear_fvg = show_fvg and bear_fvg ? color.new(color.red,   85) : na
-bgcolor(bgcolor_bull_fvg, title = "Bullish FVG")
-bgcolor(bgcolor_bear_fvg, title = "Bearish FVG")
-
-// OB boxes (last active only)
-var box bull_ob_box = na
-var box bear_ob_box = na
-
-if not bull_ob_mitigated and show_ob and bull_ob_hi > bull_ob_lo
-    box.delete(bull_ob_box)
-    bull_ob_box := box.new(bar_index - ob_lookback, bull_ob_hi, bar_index + 3, bull_ob_lo,
-                           border_color = color.new(color.teal, 10),
-                           bgcolor      = color.new(color.teal, 80),
-                           border_width = 1)
-
-if not bear_ob_mitigated and show_ob and bear_ob_hi > bear_ob_lo
-    box.delete(bear_ob_box)
-    bear_ob_box := box.new(bar_index - ob_lookback, bear_ob_hi, bar_index + 3, bear_ob_lo,
-                           border_color = color.new(color.orange, 10),
-                           bgcolor      = color.new(color.orange, 80),
-                           border_width = 1)
-
-// Signal labels
-if long_signal and show_labels
-    label.new(bar_index, low,  "▲ PO3 Long\n" + (long_ob_conf ? "OB" : "FVG"),
-              style      = label.style_label_up,
-              color      = color.new(color.green, 10),
-              textcolor  = color.white,
-              size       = size.small)
-
-if short_signal and show_labels
-    label.new(bar_index, high, "▼ PO3 Short\n" + (short_ob_conf ? "OB" : "FVG"),
-              style      = label.style_label_down,
-              color      = color.new(color.red, 10),
-              textcolor  = color.white,
-              size       = size.small)
-
-// Session background tint
-bgcolor(in_asian  ? color.new(color.yellow, 96) : na, title = "Asian Session BG")
-bgcolor(in_london ? color.new(color.blue,   96) : na, title = "London Session BG")
-bgcolor(in_ny     ? color.new(color.purple, 96) : na, title = "NY Session BG")
+if bfvg_ok and low < bfvg_lo
+    bfvg_ok := false
+if sfvg_ok and high > sfvg_hi
+    sfvg_ok := false
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PLOTS — for status line / data window
+// ORDER BLOCKS
 // ─────────────────────────────────────────────────────────────────────────────
 
-plot(asian_set ? asian_hi  : na, "Asian High",   color = color.new(color.yellow, 30), linewidth = 1, style = plot.style_stepline)
-plot(asian_set ? asian_lo  : na, "Asian Low",    color = color.new(color.yellow, 30), linewidth = 1, style = plot.style_stepline)
-plot(asian_set ? asian_mid : na, "Asian Mid",    color = color.new(color.yellow, 50), linewidth = 1, style = plot.style_stepline)
+bull_impulse = close > open and close > close[1] * 1.002
+bear_impulse = close < open and close < close[1] * 0.998
 
-plotshape(bull_sweep and show_labels, "Bull Sweep", shape.triangledown,
+var float bob_lo = na
+var float bob_hi = na
+var float soo_lo = na
+var float soo_hi = na
+var bool  bob_ok = false
+var bool  soo_ok = false
+
+if use_ob
+    // Bullish OB: última vela bajista antes de un impulso alcista
+    if bull_impulse and close[ob_look] < open[ob_look]
+        bob_lo := close[ob_look]
+        bob_hi := open[ob_look]
+        bob_ok := true
+    // Bearish OB: última vela alcista antes de un impulso bajista
+    if bear_impulse and close[ob_look] > open[ob_look]
+        soo_lo := open[ob_look]
+        soo_hi := close[ob_look]
+        soo_ok := true
+
+if bob_ok and low < bob_lo
+    bob_ok := false
+if soo_ok and high > soo_hi
+    soo_ok := false
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONFLUENCIA — precio dentro de OB o FVG
+// ─────────────────────────────────────────────────────────────────────────────
+
+bull_ob_in  = use_ob  and bob_ok and close >= bob_lo and close <= bob_hi
+bull_fvg_in = use_fvg and bfvg_ok and close >= bfvg_lo and close <= bfvg_hi
+bear_ob_in  = use_ob  and soo_ok and close >= soo_lo and close <= soo_hi
+bear_fvg_in = use_fvg and sfvg_ok and close >= sfvg_lo and close <= sfvg_hi
+
+bull_conf = bull_ob_in or bull_fvg_in
+bear_conf = bear_ob_in or bear_fvg_in
+
+bull_conf_lbl = bull_ob_in ? "OB" : bull_fvg_in ? "FVG" : "SWEEP"
+bear_conf_lbl = bear_ob_in ? "OB" : bear_fvg_in ? "FVG" : "SWEEP"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONTROL DE ENTRADAS DIARIAS
+// ─────────────────────────────────────────────────────────────────────────────
+
+var int day_count  = 0
+var int prev_day   = 0
+cur_day = dayofmonth + month * 31 + year * 366
+
+if cur_day != prev_day
+    day_count := 0
+    prev_day  := cur_day
+
+can_enter = strategy.position_size == 0 and day_count < max_day_tr
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SEÑALES — DISTRIBUCIÓN (PO3 Fase 3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+long_signal  = can_enter and bull_sweep and (not need_conf or bull_conf)
+short_signal = can_enter and bear_sweep and (not need_conf or bear_conf)
+
+// Stop Loss: más allá de la mecha del sweep + buffer
+long_sl  = low  - pct(sl_buf_pct, low)
+long_tp  = close + (close - long_sl) * rr
+
+short_sl = high + pct(sl_buf_pct, high)
+short_tp = close - (short_sl - close) * rr
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WEBHOOK JSON — WUNDERTRADING
+// ─────────────────────────────────────────────────────────────────────────────
+// Mensaje que TradingView enviará vía {{strategy.order.alert_message}}
+
+wt_buy  = '{"key":"' + wt_key + '","message":"open_long","amount_type":"percent","amount":' + str.tostring(wt_amount, "#") + '}'
+wt_sell = '{"key":"' + wt_key + '","message":"open_short","amount_type":"percent","amount":' + str.tostring(wt_amount, "#") + '}'
+wt_cls  = '{"key":"' + wt_key + '","message":"close_position"}'
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ÓRDENES + ALERTAS
+// ─────────────────────────────────────────────────────────────────────────────
+
+if long_signal
+    strategy.entry("Long", strategy.long, alert_message = wt_buy)
+    strategy.exit("Long Exit", "Long", stop = long_sl, limit = long_tp, alert_message = wt_cls)
+    day_count += 1
+
+if short_signal
+    strategy.entry("Short", strategy.short, alert_message = wt_sell)
+    strategy.exit("Short Exit", "Short", stop = short_sl, limit = short_tp, alert_message = wt_cls)
+    day_count += 1
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VISUALES
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Niveles de liquidez
+col_pdh = color.new(color.red,    25)
+col_pdl = color.new(color.green,  25)
+col_pwh = color.new(color.orange, 15)
+col_pwl = color.new(color.teal,   15)
+
+plot(show_lvl and use_pdhl ? pdh : na, "PDH", col_pdh, 1, plot.style_stepline)
+plot(show_lvl and use_pdhl ? pdl : na, "PDL", col_pdl, 1, plot.style_stepline)
+plot(show_lvl and use_pwhl ? pwh : na, "PWH", col_pwh, 2, plot.style_stepline)
+plot(show_lvl and use_pwhl ? pwl : na, "PWL", col_pwl, 2, plot.style_stepline)
+
+// EQH / EQL — diamantes sobre/bajo la vela
+plotshape(show_lvl and use_eqhl and eqh_hit, "EQH", shape.diamond,
           location.abovebar, color.new(color.red,   0), size = size.tiny)
-plotshape(bear_sweep and show_labels, "Bear Sweep", shape.triangleup,
+plotshape(show_lvl and use_eqhl and eql_hit, "EQL", shape.diamond,
           location.belowbar, color.new(color.green, 0), size = size.tiny)
+
+// Sweeps (fondo semitransparente en la vela)
+bgcolor(show_sweep and bull_sweep ? color.new(color.green, 82) : na, title = "Sweep Alcista")
+bgcolor(show_sweep and bear_sweep ? color.new(color.red,   82) : na, title = "Sweep Bajista")
+
+// Marcadores de sweep
+plotshape(show_sweep and bull_sweep, "▲ Sweep Long",
+          shape.triangleup,   location.belowbar, color.new(color.green, 0), size = size.small)
+plotshape(show_sweep and bear_sweep, "▼ Sweep Short",
+          shape.triangledown, location.abovebar, color.new(color.red,   0), size = size.small)
+
+// FVG — fondo de color en la zona
+bgcolor(show_fvg_bg and bull_fvg_new ? color.new(color.lime,  90) : na, title = "FVG Alcista")
+bgcolor(show_fvg_bg and bear_fvg_new ? color.new(color.red,   90) : na, title = "FVG Bajista")
+
+// Order Blocks — cajas
+var box bull_ob_bx = na
+var box bear_ob_bx = na
+
+if show_ob_box and bob_ok
+    box.delete(bull_ob_bx)
+    bull_ob_bx := box.new(bar_index - ob_look, bob_hi, bar_index + 4, bob_lo,
+                          border_color = color.new(color.teal,   10),
+                          bgcolor      = color.new(color.teal,   82),
+                          border_width = 1)
+
+if show_ob_box and soo_ok
+    box.delete(bear_ob_bx)
+    bear_ob_bx := box.new(bar_index - ob_look, soo_hi, bar_index + 4, soo_lo,
+                          border_color = color.new(color.orange, 10),
+                          bgcolor      = color.new(color.orange, 82),
+                          border_width = 1)
+
+// Etiquetas de entrada
+if long_signal and show_lbl
+    label.new(bar_index, low,
+              "▲ LONG PO3\n" + bull_conf_lbl +
+              "\nSL " + str.tostring(math.round(long_sl,  2)) +
+              "  TP " + str.tostring(math.round(long_tp,  2)),
+              style     = label.style_label_up,
+              color     = color.new(color.green, 5),
+              textcolor = color.white,
+              size      = size.normal)
+
+if short_signal and show_lbl
+    label.new(bar_index, high,
+              "▼ SHORT PO3\n" + bear_conf_lbl +
+              "\nSL " + str.tostring(math.round(short_sl, 2)) +
+              "  TP " + str.tostring(math.round(short_tp, 2)),
+              style     = label.style_label_down,
+              color     = color.new(color.red,   5),
+              textcolor = color.white,
+              size      = size.normal)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TABLA DE ESTADO — esquina superior derecha
+// ─────────────────────────────────────────────────────────────────────────────
+
+var table info = table.new(position.top_right, 2, 6,
+     bgcolor      = color.new(color.black, 70),
+     border_color = color.new(color.gray, 50),
+     border_width = 1,
+     frame_color  = color.new(color.gray, 40),
+     frame_width  = 1)
+
+cell(r, c, txt, tc) =>
+    table.cell(info, c, r, txt, text_color = tc, text_size = size.small)
+
+cell(0, 0, "PO3 4H BTC/USDC",  color.white)
+cell(0, 1, timeframe.period + "H · " + syminfo.exchange, color.silver)
+cell(1, 0, "Vol Inst.", color.silver)
+cell(1, 1, inst_vol ? "✔ SÍ" : "—", inst_vol ? color.lime : color.gray)
+cell(2, 0, "Bull Sweep", color.silver)
+cell(2, 1, bull_sweep ? "✔ ACTIVO" : "—", bull_sweep ? color.lime : color.gray)
+cell(3, 0, "Bear Sweep", color.silver)
+cell(3, 1, bear_sweep ? "✔ ACTIVO" : "—", bear_sweep ? color.red  : color.gray)
+cell(4, 0, "Confluencia", color.silver)
+cell(4, 1, bull_conf ? "OB/FVG Long" : bear_conf ? "OB/FVG Short" : "—",
+     bull_conf ? color.lime : bear_conf ? color.red : color.gray)
+cell(5, 0, "Trades hoy", color.silver)
+cell(5, 1, str.tostring(day_count) + "/" + str.tostring(max_day_tr),
+     day_count >= max_day_tr ? color.red : color.lime)
