@@ -1,0 +1,319 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// © rpmnode
+
+//@version=5
+strategy(
+     title        = "AUTO TV PO3 — Power of 3 Algo",
+     shorttitle   = "PO3 Algo",
+     overlay      = true,
+     margin_long  = 100,
+     margin_short = 100,
+     default_qty_type  = strategy.percent_of_equity,
+     default_qty_value = 2,
+     initial_capital   = 10000,
+     commission_type   = strategy.commission.percent,
+     commission_value  = 0.05,
+     slippage          = 1
+     )
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+var GRP_SESSIONS = "Sessions"
+asian_open  = input.session("0000-0800", "Asian Session",   group = GRP_SESSIONS)
+london_open = input.session("0800-1200", "London Session",  group = GRP_SESSIONS)
+ny_open     = input.session("1200-2000", "NY Session",      group = GRP_SESSIONS)
+timezone    = input.string("UTC", "Timezone",               group = GRP_SESSIONS)
+
+var GRP_PO3 = "Power of 3"
+sweep_pct   = input.float(0.1,  "Sweep Buffer (%)", minval = 0.0, step = 0.05, group = GRP_PO3,
+                          tooltip = "How far price must close beyond the Asian range to confirm manipulation.")
+fvg_min_pct = input.float(0.05, "Min FVG Size (%)", minval = 0.0, step = 0.01, group = GRP_PO3,
+                          tooltip = "Minimum gap size (as % of price) to qualify as a Fair Value Gap.")
+ob_lookback = input.int(3, "Order Block Lookback (bars)", minval = 1, maxval = 10, group = GRP_PO3)
+
+var GRP_RISK = "Risk Management"
+rr_ratio    = input.float(2.0,  "Risk : Reward",      minval = 0.5,  step = 0.5,  group = GRP_RISK)
+sl_buffer   = input.float(0.05, "SL Buffer (%)",      minval = 0.0,  step = 0.01, group = GRP_RISK,
+                          tooltip = "Extra buffer added beyond the manipulation wick for the stop loss.")
+max_trades  = input.int(1,   "Max Trades / Session",  minval = 1,    maxval = 5,  group = GRP_RISK)
+trade_sess  = input.string("London + NY", "Trade During",
+                           options = ["London Only", "NY Only", "London + NY"], group = GRP_RISK)
+
+var GRP_DISPLAY = "Display"
+show_asian  = input.bool(true, "Show Asian Range",    group = GRP_DISPLAY)
+show_fvg    = input.bool(true, "Show FVGs",           group = GRP_DISPLAY)
+show_ob     = input.bool(true, "Show Order Blocks",   group = GRP_DISPLAY)
+show_labels = input.bool(true, "Show Signal Labels",  group = GRP_DISPLAY)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SESSION DETECTION
+// ─────────────────────────────────────────────────────────────────────────────
+
+in_asian  = not na(time(timeframe.period, asian_open,  timezone))
+in_london = not na(time(timeframe.period, london_open, timezone))
+in_ny     = not na(time(timeframe.period, ny_open,     timezone))
+
+in_trade_session = switch trade_sess
+    "London Only"   => in_london
+    "NY Only"       => in_ny
+    => in_london or in_ny  // London + NY
+
+// Detect session transitions
+asian_started  = in_asian  and not in_asian[1]
+asian_ended    = not in_asian and in_asian[1]
+london_started = in_london and not in_london[1]
+ny_started     = in_ny and not in_ny[1]
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ASIAN RANGE — ACCUMULATION PHASE
+// ─────────────────────────────────────────────────────────────────────────────
+
+var float asian_hi   = na
+var float asian_lo   = na
+var float asian_mid  = na
+var bool  asian_set  = false
+var int   daily_trades = 0
+
+// Reset at start of each Asian session
+if asian_started
+    asian_hi     := high
+    asian_lo     := low
+    asian_set    := false
+    daily_trades := 0
+
+// Build range during Asian session
+if in_asian
+    asian_hi := math.max(asian_hi, high)
+    asian_lo := math.min(asian_lo, low)
+
+// Lock range when Asian session ends
+if asian_ended
+    asian_mid := math.avg(asian_hi, asian_lo)
+    asian_set := true
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FAIR VALUE GAP DETECTION
+// ─────────────────────────────────────────────────────────────────────────────
+
+fvg_min_size(p) => p * fvg_min_pct / 100
+
+// Bullish FVG: gap between candle[-2].high and candle[0].low (with middle candle body up)
+bull_fvg_top = high[2]
+bull_fvg_bot = low[0]
+bull_fvg     = close[1] > open[1] and low[0] > high[2] and
+               (low[0] - high[2]) >= fvg_min_size(close)
+
+// Bearish FVG: gap between candle[-2].low and candle[0].high
+bear_fvg_bot = low[2]
+bear_fvg_top = high[0]
+bear_fvg     = close[1] < open[1] and high[0] < low[2] and
+               (low[2] - high[0]) >= fvg_min_size(close)
+
+// Track recent FVG levels (last unfilled)
+var float last_bull_fvg_top = na
+var float last_bull_fvg_bot = na
+var float last_bear_fvg_top = na
+var float last_bear_fvg_bot = na
+var bool  bull_fvg_filled   = true
+var bool  bear_fvg_filled   = true
+
+if bull_fvg
+    last_bull_fvg_top := bull_fvg_top
+    last_bull_fvg_bot := bull_fvg_bot
+    bull_fvg_filled   := false
+
+if bear_fvg
+    last_bear_fvg_top := bear_fvg_top
+    last_bear_fvg_bot := bear_fvg_bot
+    bear_fvg_filled   := false
+
+// Mark FVG as filled when price enters the gap zone
+if not bull_fvg_filled and low <= last_bull_fvg_top
+    bull_fvg_filled := true
+
+if not bear_fvg_filled and high >= last_bear_fvg_bot
+    bear_fvg_filled := true
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ORDER BLOCK DETECTION
+// ─────────────────────────────────────────────────────────────────────────────
+// Bullish OB: last bearish candle before a strong bullish impulse
+// Bearish OB: last bullish candle before a strong bearish impulse
+
+is_bull_impulse = close > close[1] * 1.001 and close > open
+is_bear_impulse = close < close[1] * 0.999 and close < open
+
+var float bull_ob_hi = na
+var float bull_ob_lo = na
+var float bear_ob_hi = na
+var float bear_ob_lo = na
+var bool  bull_ob_mitigated = true
+var bool  bear_ob_mitigated = true
+
+// Bearish candle before bullish impulse → bullish OB
+if is_bull_impulse and close[ob_lookback] < open[ob_lookback]
+    bull_ob_hi       := open[ob_lookback]
+    bull_ob_lo       := close[ob_lookback]
+    bull_ob_mitigated := false
+
+// Bullish candle before bearish impulse → bearish OB
+if is_bear_impulse and close[ob_lookback] > open[ob_lookback]
+    bear_ob_hi       := close[ob_lookback]
+    bear_ob_lo       := open[ob_lookback]
+    bear_ob_mitigated := false
+
+// Mitigate when price trades through OB
+if not bull_ob_mitigated and low <= bull_ob_lo
+    bull_ob_mitigated := true
+
+if not bear_ob_mitigated and high >= bear_ob_hi
+    bear_ob_mitigated := true
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MANIPULATION (SWEEP) DETECTION — PO3 PHASE 2
+// ─────────────────────────────────────────────────────────────────────────────
+
+sweep_buf_pts(p) => p * sweep_pct / 100
+
+// Bullish sweep: price wicks below Asian low then closes above it → bearish manipulation (hunt stops below)
+bull_sweep = asian_set and not in_asian and
+             low < asian_lo - sweep_buf_pts(asian_lo) and
+             close > asian_lo
+
+// Bearish sweep: price wicks above Asian high then closes below it → bullish manipulation (hunt stops above)
+bear_sweep = asian_set and not in_asian and
+             high > asian_hi + sweep_buf_pts(asian_hi) and
+             close < asian_hi
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENTRY CONDITIONS — PO3 PHASE 3: DISTRIBUTION
+// ─────────────────────────────────────────────────────────────────────────────
+// After a sweep, look for confluence with OB or FVG to enter in the TRUE direction.
+
+can_trade = in_trade_session and asian_set and daily_trades < max_trades
+
+// Long entry: bearish sweep (stop hunt below) → expect bullish distribution
+// Confluence: price near a bullish OB or unfilled bullish FVG
+long_ob_conf  = not bull_ob_mitigated and close >= bull_ob_lo and close <= bull_ob_hi
+long_fvg_conf = not bull_fvg_filled  and close >= last_bull_fvg_bot and close <= last_bull_fvg_top
+
+long_signal = can_trade and bull_sweep and (long_ob_conf or long_fvg_conf)
+
+// Short entry: bullish sweep (stop hunt above) → expect bearish distribution
+// Confluence: price near a bearish OB or unfilled bearish FVG
+short_ob_conf  = not bear_ob_mitigated and close >= bear_ob_lo and close <= bear_ob_hi
+short_fvg_conf = not bear_fvg_filled  and close >= last_bear_fvg_bot and close <= last_bear_fvg_top
+
+short_signal = can_trade and bear_sweep and (short_ob_conf or short_fvg_conf)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STOP LOSS & TAKE PROFIT
+// ─────────────────────────────────────────────────────────────────────────────
+
+sl_buf_pts(p) => p * sl_buffer / 100
+
+long_sl  = low  - sl_buf_pts(low)          // below manipulation wick
+long_tp  = close + (close - long_sl) * rr_ratio
+
+short_sl = high + sl_buf_pts(high)         // above manipulation wick
+short_tp = close - (short_sl - close) * rr_ratio
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STRATEGY ORDERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+if long_signal and strategy.position_size == 0
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", stop = long_sl, limit = long_tp)
+    daily_trades += 1
+
+if short_signal and strategy.position_size == 0
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", stop = short_sl, limit = short_tp)
+    daily_trades += 1
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VISUALS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Asian Range box
+var box asian_box = na
+var line asian_mid_line = na
+
+if asian_ended and show_asian
+    box.delete(asian_box)
+    line.delete(asian_mid_line)
+    asian_box      := box.new(bar_index[1], asian_hi, bar_index + 50, asian_lo,
+                              border_color = color.new(color.yellow, 20),
+                              bgcolor      = color.new(color.yellow, 88),
+                              border_width = 1)
+    asian_mid_line := line.new(bar_index[1], asian_mid, bar_index + 50, asian_mid,
+                               color = color.new(color.yellow, 40),
+                               style = line.style_dashed,
+                               width = 1)
+
+// Extend Asian range box each bar while it exists
+if not in_asian and asian_set and show_asian
+    if not na(asian_box)
+        box.set_right(asian_box, bar_index + 5)
+    if not na(asian_mid_line)
+        line.set_x2(asian_mid_line, bar_index + 5)
+
+// FVG shading
+bgcolor_bull_fvg = show_fvg and bull_fvg ? color.new(color.green, 85) : na
+bgcolor_bear_fvg = show_fvg and bear_fvg ? color.new(color.red,   85) : na
+bgcolor(bgcolor_bull_fvg, title = "Bullish FVG")
+bgcolor(bgcolor_bear_fvg, title = "Bearish FVG")
+
+// OB boxes (last active only)
+var box bull_ob_box = na
+var box bear_ob_box = na
+
+if not bull_ob_mitigated and show_ob and bull_ob_hi > bull_ob_lo
+    box.delete(bull_ob_box)
+    bull_ob_box := box.new(bar_index - ob_lookback, bull_ob_hi, bar_index + 3, bull_ob_lo,
+                           border_color = color.new(color.teal, 10),
+                           bgcolor      = color.new(color.teal, 80),
+                           border_width = 1)
+
+if not bear_ob_mitigated and show_ob and bear_ob_hi > bear_ob_lo
+    box.delete(bear_ob_box)
+    bear_ob_box := box.new(bar_index - ob_lookback, bear_ob_hi, bar_index + 3, bear_ob_lo,
+                           border_color = color.new(color.orange, 10),
+                           bgcolor      = color.new(color.orange, 80),
+                           border_width = 1)
+
+// Signal labels
+if long_signal and show_labels
+    label.new(bar_index, low,  "▲ PO3 Long\n" + (long_ob_conf ? "OB" : "FVG"),
+              style      = label.style_label_up,
+              color      = color.new(color.green, 10),
+              textcolor  = color.white,
+              size       = size.small)
+
+if short_signal and show_labels
+    label.new(bar_index, high, "▼ PO3 Short\n" + (short_ob_conf ? "OB" : "FVG"),
+              style      = label.style_label_down,
+              color      = color.new(color.red, 10),
+              textcolor  = color.white,
+              size       = size.small)
+
+// Session background tint
+bgcolor(in_asian  ? color.new(color.yellow, 96) : na, title = "Asian Session BG")
+bgcolor(in_london ? color.new(color.blue,   96) : na, title = "London Session BG")
+bgcolor(in_ny     ? color.new(color.purple, 96) : na, title = "NY Session BG")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PLOTS — for status line / data window
+// ─────────────────────────────────────────────────────────────────────────────
+
+plot(asian_set ? asian_hi  : na, "Asian High",   color = color.new(color.yellow, 30), linewidth = 1, style = plot.style_stepline)
+plot(asian_set ? asian_lo  : na, "Asian Low",    color = color.new(color.yellow, 30), linewidth = 1, style = plot.style_stepline)
+plot(asian_set ? asian_mid : na, "Asian Mid",    color = color.new(color.yellow, 50), linewidth = 1, style = plot.style_stepline)
+
+plotshape(bull_sweep and show_labels, "Bull Sweep", shape.triangledown,
+          location.abovebar, color.new(color.red,   0), size = size.tiny)
+plotshape(bear_sweep and show_labels, "Bear Sweep", shape.triangleup,
+          location.belowbar, color.new(color.green, 0), size = size.tiny)
