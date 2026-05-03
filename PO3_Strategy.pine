@@ -2,377 +2,366 @@
 // © rpmnode
 //
 // ══════════════════════════════════════════════════════════════════════════════
-//  AUTO TV PO3 — BTC/USDC 4H · Flujo Institucional
-//  Power of 3: Acumulación → Manipulación (absorción de liquidez) → Distribución
+//  AUTO TV PO3 — BTC/USDC · Cruces SMA + Power of Three
+//  Integración directa TradingView → Binance (sin WunderTrading)
 // ══════════════════════════════════════════════════════════════════════════════
 //
-//  CONFIGURACIÓN WUNDERTRADING → TRADINGVIEW → BINANCE
-//  ────────────────────────────────────────────────────
-//  1. WunderTrading → Mis Bots → Nuevo Bot → Binance Spot → BTC/USDC
-//  2. Copia el "Bot Secret Key" → pégalo en el input "WT Bot Secret Key"
-//  3. TradingView → Alertas → Nueva alerta sobre este script
-//       · Condición : PO3 4H BTC — cualquier alerta
-//       · Mensaje   : {{strategy.order.alert_message}}
-//       · Webhook   : https://wundertrading.com/api/v1/bots/{TU_BOT_ID}/signals
-//  4. Guarda y activa la alerta — WunderTrading ejecutará en Binance automáticamente
+//  LÓGICA PRINCIPAL
+//  ─────────────────
+//  ENTRADA LONG  : SMA rápida cruza sobre SMA lenta
+//                  + precio sobre SMA tendencia (alcista)
+//                  + [opcional] sweep PO3 reciente confirmado
+//
+//  ENTRADA SHORT : SMA rápida cruza bajo SMA lenta
+//                  + precio bajo SMA tendencia (bajista)
+//                  + [opcional] sweep PO3 reciente confirmado
+//
+//  SALIDA        : cruce SMA inverso  ó  SL fijo sobre mínimo/máximo de entrada
+//
+//  EJECUCIÓN     : TradingView → Panel de trading → Binance → orden OCO automática
+//                  (SL y TP los gestiona Binance de forma independiente)
 //
 // ══════════════════════════════════════════════════════════════════════════════
 
 //@version=5
 strategy(
-     title                  = "AUTO TV PO3 — BTC/USDC 4H Institucional",
-     shorttitle             = "PO3 4H BTC",
+     title                  = "AUTO TV PO3 — BTC/USDC SMA + Power of Three",
+     shorttitle             = "PO3 SMA",
      overlay                = true,
      pyramiding             = 0,
      default_qty_type       = strategy.percent_of_equity,
      default_qty_value      = 100,
-     initial_capital        = 10000,
+     initial_capital        = 2000,
      commission_type        = strategy.commission.percent,
-     commission_value       = 0.05,
-     slippage               = 2
+     commission_value       = 0.1,
+     slippage               = 2,
+     process_orders_on_close = true
      )
 
 // ─────────────────────────────────────────────────────────────────────────────
 // INPUTS
 // ─────────────────────────────────────────────────────────────────────────────
 
-var G1 = "⚡ WunderTrading"
-wt_key       = input.string("TU_BOT_SECRET_KEY",  "Bot Secret Key",           group = G1,
-                             tooltip = "Pega aquí el Secret Key del bot de WunderTrading.\nATENCIÓN: no compartas el gráfico público con esta clave visible.")
-wt_amount    = input.float(100.0, "% Capital por operación",  minval = 1, maxval = 100, step = 1, group = G1)
+var G1 = "📈 Medias Móviles (SMA)"
+sma_fast_len  = input.int(50,  "SMA Rápida",    minval = 1,  group = G1)
+sma_slow_len  = input.int(100, "SMA Lenta",     minval = 1,  group = G1)
+sma_trend_len = input.int(200, "SMA Tendencia", minval = 1,  group = G1)
+use_trend_sma = input.bool(true, "Filtro SMA Tendencia (precio > SMA200 para longs, < para shorts)", group = G1)
 
-var G2 = "💧 Pools de Liquidez"
-use_pdhl     = input.bool(true,  "PDH / PDL  (máx/mín día anterior)",    group = G2)
-use_pwhl     = input.bool(true,  "PWH / PWL  (máx/mín semana anterior)", group = G2)
-use_eqhl     = input.bool(true,  "EQH / EQL  (máximos/mínimos iguales)", group = G2)
-eq_look      = input.int(10,     "  · Lookback EQH/EQL (barras 4H)",     group = G2, minval = 3, maxval = 50)
-eq_tol       = input.float(0.15, "  · Tolerancia EQH/EQL (%)",           group = G2, minval = 0.01, step = 0.01)
+var G2 = "🔄 Cruces SMA"
+cross_type    = input.string("SMA×SMA", "Tipo de cruce", options = ["SMA×SMA", "Precio×SMA"], group = G2,
+                              tooltip = "SMA×SMA: cruce de la rápida sobre la lenta.\nPrecio×SMA: el precio cruza la SMA rápida.")
+cross_confirm = input.int(0, "Barras de confirmación del cruce", minval = 0, maxval = 5, group = G2,
+                           tooltip = "0 = señal inmediata en la vela del cruce.")
 
-var G3 = "🏦 Absorción Institucional"
-vol_mult     = input.float(1.5,  "Multiplicador de volumen (sweep)",  group = G3, minval = 1.0, step = 0.1,
-                            tooltip = "El volumen del sweep debe superar N × la media para confirmar absorción institucional.")
-vol_len      = input.int(20,     "Período media de volumen",          group = G3, minval = 5, maxval = 100)
-wick_min_pct = input.float(0.20, "Wick mínimo del sweep (%)",         group = G3, minval = 0.0, step = 0.05,
-                            tooltip = "La mecha de la vela debe superar este % del precio para validar el stop hunt.")
+var G3 = "🏦 PO3 — Absorción de Liquidez"
+use_po3       = input.bool(true,  "Activar filtro PO3 (sweep institucional)", group = G3)
+po3_bars      = input.int(10,     "Ventana de sweep válido (barras atrás)",   group = G3, minval = 1, maxval = 50)
+use_pdhl      = input.bool(true,  "PDH / PDL  (día anterior)",                group = G3)
+use_pwhl      = input.bool(true,  "PWH / PWL  (semana anterior)",             group = G3)
+use_eqhl      = input.bool(true,  "EQH / EQL  (máximos/mínimos iguales)",     group = G3)
+eq_look       = input.int(10,     "  · Lookback EQH/EQL",                     group = G3, minval = 3, maxval = 50)
+eq_tol        = input.float(0.15, "  · Tolerancia EQH/EQL (%)",               group = G3, minval = 0.01, step = 0.01)
+vol_mult      = input.float(1.5,  "  · Multiplicador volumen institucional",   group = G3, minval = 1.0, step = 0.1)
+vol_len       = input.int(20,     "  · Período media volumen",                 group = G3, minval = 5)
+wick_pct      = input.float(0.20, "  · Wick mínimo sweep (%)",                group = G3, minval = 0.0, step = 0.05)
 
-var G4 = "🎯 Confluencia OB / FVG"
-use_ob       = input.bool(true,  "Filtro Order Block",                group = G4)
-use_fvg      = input.bool(true,  "Filtro Fair Value Gap",             group = G4)
-need_conf    = input.bool(false, "Exigir confluencia para la entrada", group = G4,
-                           tooltip = "Si está activo, sólo entra cuando el precio está dentro de un OB o FVG válido.")
-ob_look      = input.int(3,      "  · Lookback Order Block (barras)", group = G4, minval = 1, maxval = 10)
-fvg_min_pct  = input.float(0.05, "  · FVG mínimo (%)",               group = G4, minval = 0.0, step = 0.01)
+var G4 = "🛡️ Gestión de Riesgo"
+sl_mode       = input.string("Wick", "Stop Loss basado en", options = ["Wick", "ATR", "Porcentaje"], group = G4)
+sl_atr_len    = input.int(14,    "  · Período ATR",          group = G4, minval = 1)
+sl_atr_mult   = input.float(1.5, "  · Multiplicador ATR",    group = G4, minval = 0.1, step = 0.1)
+sl_pct        = input.float(1.0, "  · SL porcentaje (%)",    group = G4, minval = 0.1, step = 0.1)
+sl_buf        = input.float(0.1, "  · Buffer extra SL (%)",  group = G4, minval = 0.0, step = 0.05)
+use_tp        = input.bool(true,  "Usar Take Profit fijo (R:R)", group = G4)
+rr            = input.float(2.0,  "  · Risk : Reward",        group = G4, minval = 0.5, step = 0.5)
+max_day       = input.int(3,      "Máx. entradas por día",    group = G4, minval = 1, maxval = 10)
 
-var G5 = "🛡️ Gestión de Riesgo"
-rr           = input.float(2.5,  "Risk : Reward",           group = G5, minval = 0.5, step = 0.5)
-sl_buf_pct   = input.float(0.10, "Buffer SL sobre el wick (%)", group = G5, minval = 0.0, step = 0.05)
-max_day_tr   = input.int(2,      "Máx. entradas por día",    group = G5, minval = 1, maxval = 5)
-
-var G6 = "🎨 Visual"
-show_lvl     = input.bool(true, "Niveles de liquidez",     group = G6)
-show_lbl     = input.bool(true, "Etiquetas de señal",      group = G6)
-show_fvg_bg  = input.bool(true, "Zonas FVG",               group = G6)
-show_ob_box  = input.bool(true, "Cajas Order Block",       group = G6)
-show_sweep   = input.bool(true, "Marcar sweeps",           group = G6)
-
-// ─────────────────────────────────────────────────────────────────────────────
-// FUNCIONES AUXILIARES
-// ─────────────────────────────────────────────────────────────────────────────
-
-pct(p, x) => p * x / 100
+var G5 = "🎨 Visual"
+show_sma      = input.bool(true, "Mostrar SMAs",           group = G5)
+show_lvl      = input.bool(true, "Mostrar niveles PO3",    group = G5)
+show_sweep    = input.bool(true, "Marcar sweeps",          group = G5)
+show_lbl      = input.bool(true, "Etiquetas de señal",     group = G5)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// NIVELES DE LIQUIDEZ — ACUMULACIÓN
+// MEDIAS MÓVILES
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Previous Day High / Low  (con lookahead correcto usando [1] en la fuente)
+sma_fast  = ta.sma(close, sma_fast_len)
+sma_slow  = ta.sma(close, sma_slow_len)
+sma_trend = ta.sma(close, sma_trend_len)
+
+// Cruces
+cross_src_bull = cross_type == "SMA×SMA" ? sma_fast : close
+cross_src_bear = cross_type == "SMA×SMA" ? sma_fast : close
+cross_ref      = cross_type == "SMA×SMA" ? sma_slow  : sma_fast
+
+bull_cross_raw = ta.crossover(cross_src_bull,  cross_ref)
+bear_cross_raw = ta.crossunder(cross_src_bear, cross_ref)
+
+// Confirmación por N barras
+bull_cross = cross_confirm == 0 ? bull_cross_raw : ta.barssince(bull_cross_raw) == cross_confirm
+bear_cross = cross_confirm == 0 ? bear_cross_raw : ta.barssince(bear_cross_raw) == cross_confirm
+
+// Filtro de tendencia
+trend_bull = not use_trend_sma or close > sma_trend
+trend_bear = not use_trend_sma or close < sma_trend
+
+// Estado SMA para exit
+sma_bull_aligned = sma_fast > sma_slow   // largo sigue activo mientras fast > slow
+sma_bear_aligned = sma_fast < sma_slow   // corto sigue activo mientras fast < slow
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NIVELES DE LIQUIDEZ PO3
+// ─────────────────────────────────────────────────────────────────────────────
+
 pdh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_on)
 pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead = barmerge.lookahead_on)
-
-// Previous Week High / Low
 pwh = request.security(syminfo.tickerid, "W", high[1], lookahead = barmerge.lookahead_on)
 pwl = request.security(syminfo.tickerid, "W", low[1],  lookahead = barmerge.lookahead_on)
 
-// Equal Highs / Equal Lows — clusters de stops visible en el gráfico 4H
-var float eqh_level = na
-var float eql_level = na
-eqh_hit = false
-eql_hit = false
+pct(p, x) => p * x / 100
+
+eqh_hit   = false
+eql_hit   = false
+var float eqh_lvl = na
+var float eql_lvl = na
 
 if use_eqhl
     for i = 1 to eq_look
         if math.abs(high - high[i]) <= pct(eq_tol, high)
-            eqh_hit   := true
-            eqh_level := math.max(high, high[i])
+            eqh_hit := true
+            eqh_lvl := math.max(high, high[i])
         if math.abs(low - low[i]) <= pct(eq_tol, low)
-            eql_hit   := true
-            eql_level := math.min(low, low[i])
+            eql_hit := true
+            eql_lvl := math.min(low, low[i])
 
 // ─────────────────────────────────────────────────────────────────────────────
-// VOLUMEN — DETECCIÓN DE ABSORCIÓN INSTITUCIONAL
+// DETECCIÓN DE SWEEP + ABSORCIÓN INSTITUCIONAL (PO3)
 // ─────────────────────────────────────────────────────────────────────────────
 
-vol_avg   = ta.sma(volume, vol_len)
-inst_vol  = volume >= vol_avg * vol_mult   // volumen institucional confirmado
+vol_avg      = ta.sma(volume, vol_len)
+inst_vol     = volume >= vol_avg * vol_mult
+
+lower_wick   = math.min(open, close) - low
+upper_wick   = high - math.max(open, close)
+bull_wick_ok = lower_wick >= pct(wick_pct, low)
+bear_wick_ok = upper_wick >= pct(wick_pct, high)
+
+// Bull sweep: stop hunt bajo pool de liquidez → institución compra
+bull_sw_pdl = use_pdhl and low < pdl and close > pdl and bull_wick_ok
+bull_sw_pwl = use_pwhl and low < pwl and close > pwl and bull_wick_ok
+bull_sw_eql = use_eqhl and eql_hit and low < eql_lvl and close > eql_lvl and bull_wick_ok
+
+// Bear sweep: stop hunt sobre pool de liquidez → institución vende
+bear_sw_pdh = use_pdhl and high > pdh and close < pdh and bear_wick_ok
+bear_sw_pwh = use_pwhl and high > pwh and close < pwh and bear_wick_ok
+bear_sw_eqh = use_eqhl and eqh_hit and high > eqh_lvl and close < eqh_lvl and bear_wick_ok
+
+bull_sweep_now = (bull_sw_pdl or bull_sw_pwl or bull_sw_eql) and inst_vol
+bear_sweep_now = (bear_sw_pdh or bear_sw_pwh or bear_sw_eqh) and inst_vol
+
+// Sweep válido si ocurrió dentro de los últimos N barras
+var int bull_sweep_bar = na
+var int bear_sweep_bar = na
+
+if bull_sweep_now
+    bull_sweep_bar := bar_index
+if bear_sweep_now
+    bear_sweep_bar := bar_index
+
+bull_sweep_recent = not na(bull_sweep_bar) and (bar_index - bull_sweep_bar) <= po3_bars
+bear_sweep_recent = not na(bear_sweep_bar) and (bar_index - bear_sweep_bar) <= po3_bars
+
+// Filtro PO3
+po3_bull = not use_po3 or bull_sweep_recent
+po3_bear = not use_po3 or bear_sweep_recent
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SWEEP + ABSORCIÓN — MANIPULACIÓN (PO3 Fase 2)
-// ─────────────────────────────────────────────────────────────────────────────
-// La institución sweepea el pool de liquidez para absorber las órdenes stop
-// retail y posicionarse. La señal: mecha supera el nivel → cierre vuelve dentro.
-
-lower_wick = math.min(open, close) - low   // mecha inferior
-upper_wick = high - math.max(open, close)  // mecha superior
-
-bull_wick_ok = lower_wick >= pct(wick_min_pct, low)
-bear_wick_ok = upper_wick >= pct(wick_min_pct, high)
-
-// BULL sweep: stop hunt bajo un pool → institución absorbe vendedores y compra
-sweep_pdl = use_pdhl and low < pdl and close > pdl and bull_wick_ok
-sweep_pwl = use_pwhl and low < pwl and close > pwl and bull_wick_ok
-sweep_eql = use_eqhl and eql_hit and low < eql_level and close > eql_level and bull_wick_ok
-
-// BEAR sweep: stop hunt sobre un pool → institución absorbe compradores y vende
-sweep_pdh = use_pdhl and high > pdh and close < pdh and bear_wick_ok
-sweep_pwh = use_pwhl and high > pwh and close < pwh and bear_wick_ok
-sweep_eqh = use_eqhl and eqh_hit and high > eqh_level and close < eqh_level and bear_wick_ok
-
-bull_sweep = (sweep_pdl or sweep_pwl or sweep_eql) and inst_vol
-bear_sweep = (sweep_pdh or sweep_pwh or sweep_eqh) and inst_vol
-
-// Nivel sweepado (para SL y etiqueta)
-bull_swept_lvl = sweep_pdl ? pdl : sweep_pwl ? pwl : eql_level
-bear_swept_lvl = sweep_pdh ? pdh : sweep_pwh ? pwh : eqh_level
-
-// ─────────────────────────────────────────────────────────────────────────────
-// FAIR VALUE GAPS
+// STOP LOSS
 // ─────────────────────────────────────────────────────────────────────────────
 
-fvg_min_sz = pct(fvg_min_pct, close)
+atr_val = ta.atr(sl_atr_len)
 
-// Bullish FVG: vela [1] alcista, hueco entre high[2] y low[0]
-bull_fvg_new = close[1] > open[1] and low > high[2] and (low - high[2]) >= fvg_min_sz
-// Bearish FVG: vela [1] bajista, hueco entre high[0] y low[2]
-bear_fvg_new = close[1] < open[1] and high < low[2] and (low[2] - high) >= fvg_min_sz
+f_long_sl(entry) =>
+    switch sl_mode
+        "ATR"        => entry - atr_val * sl_atr_mult
+        "Porcentaje" => entry * (1 - sl_pct / 100)
+        =>              low - pct(sl_buf, low)   // Wick
 
-var float bfvg_lo = na  // límite inferior del Bullish FVG
-var float bfvg_hi = na  // límite superior del Bullish FVG
-var float sfvg_lo = na  // límite inferior del Bearish FVG
-var float sfvg_hi = na  // límite superior del Bearish FVG
-var bool  bfvg_ok = false
-var bool  sfvg_ok = false
-
-if bull_fvg_new
-    bfvg_lo := high[2]
-    bfvg_hi := low
-    bfvg_ok := true
-
-if bear_fvg_new
-    sfvg_lo := high
-    sfvg_hi := low[2]
-    sfvg_ok := true
-
-if bfvg_ok and low < bfvg_lo
-    bfvg_ok := false
-if sfvg_ok and high > sfvg_hi
-    sfvg_ok := false
+f_short_sl(entry) =>
+    switch sl_mode
+        "ATR"        => entry + atr_val * sl_atr_mult
+        "Porcentaje" => entry * (1 + sl_pct / 100)
+        =>              high + pct(sl_buf, high)  // Wick
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ORDER BLOCKS
+// CONTROL DIARIO
 // ─────────────────────────────────────────────────────────────────────────────
 
-bull_impulse = close > open and close > close[1] * 1.002
-bear_impulse = close < open and close < close[1] * 0.998
-
-var float bob_lo = na
-var float bob_hi = na
-var float soo_lo = na
-var float soo_hi = na
-var bool  bob_ok = false
-var bool  soo_ok = false
-
-if use_ob
-    // Bullish OB: última vela bajista antes de un impulso alcista
-    if bull_impulse and close[ob_look] < open[ob_look]
-        bob_lo := close[ob_look]
-        bob_hi := open[ob_look]
-        bob_ok := true
-    // Bearish OB: última vela alcista antes de un impulso bajista
-    if bear_impulse and close[ob_look] > open[ob_look]
-        soo_lo := open[ob_look]
-        soo_hi := close[ob_look]
-        soo_ok := true
-
-if bob_ok and low < bob_lo
-    bob_ok := false
-if soo_ok and high > soo_hi
-    soo_ok := false
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CONFLUENCIA — precio dentro de OB o FVG
-// ─────────────────────────────────────────────────────────────────────────────
-
-bull_ob_in  = use_ob  and bob_ok and close >= bob_lo and close <= bob_hi
-bull_fvg_in = use_fvg and bfvg_ok and close >= bfvg_lo and close <= bfvg_hi
-bear_ob_in  = use_ob  and soo_ok and close >= soo_lo and close <= soo_hi
-bear_fvg_in = use_fvg and sfvg_ok and close >= sfvg_lo and close <= sfvg_hi
-
-bull_conf = bull_ob_in or bull_fvg_in
-bear_conf = bear_ob_in or bear_fvg_in
-
-bull_conf_lbl = bull_ob_in ? "OB" : bull_fvg_in ? "FVG" : "SWEEP"
-bear_conf_lbl = bear_ob_in ? "OB" : bear_fvg_in ? "FVG" : "SWEEP"
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CONTROL DE ENTRADAS DIARIAS
-// ─────────────────────────────────────────────────────────────────────────────
-
-var int day_count  = 0
-var int prev_day   = 0
+var int day_count = 0
+var int prev_day  = 0
 cur_day = dayofmonth + month * 31 + year * 366
 
 if cur_day != prev_day
     day_count := 0
     prev_day  := cur_day
 
-can_enter = strategy.position_size == 0 and day_count < max_day_tr
+can_enter = strategy.position_size == 0 and day_count < max_day
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SEÑALES — DISTRIBUCIÓN (PO3 Fase 3)
+// SEÑALES DE ENTRADA Y SALIDA
 // ─────────────────────────────────────────────────────────────────────────────
 
-long_signal  = can_enter and bull_sweep and (not need_conf or bull_conf)
-short_signal = can_enter and bear_sweep and (not need_conf or bear_conf)
+// ENTRADAS
+long_signal  = can_enter and bull_cross and trend_bull and po3_bull
+short_signal = can_enter and bear_cross and trend_bear and po3_bear
 
-// Stop Loss: más allá de la mecha del sweep + buffer
-long_sl  = low  - pct(sl_buf_pct, low)
-long_tp  = close + (close - long_sl) * rr
-
-short_sl = high + pct(sl_buf_pct, high)
-short_tp = close - (short_sl - close) * rr
+// SALIDAS — cruce SMA inverso (mientras no haya posición abierta en la dirección contraria)
+exit_long  = strategy.position_size > 0 and ta.crossunder(cross_src_bear, cross_ref)
+exit_short = strategy.position_size < 0 and ta.crossover(cross_src_bull,  cross_ref)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WEBHOOK JSON — WUNDERTRADING
-// ─────────────────────────────────────────────────────────────────────────────
-// Mensaje que TradingView enviará vía {{strategy.order.alert_message}}
-
-wt_buy  = '{"key":"' + wt_key + '","message":"open_long","amount_type":"percent","amount":' + str.tostring(wt_amount, "#") + '}'
-wt_sell = '{"key":"' + wt_key + '","message":"open_short","amount_type":"percent","amount":' + str.tostring(wt_amount, "#") + '}'
-wt_cls  = '{"key":"' + wt_key + '","message":"close_position"}'
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ÓRDENES + ALERTAS
+// ÓRDENES
 // ─────────────────────────────────────────────────────────────────────────────
 
 if long_signal
-    strategy.entry("Long", strategy.long, alert_message = wt_buy)
-    strategy.exit("Long Exit", "Long", stop = long_sl, limit = long_tp, alert_message = wt_cls)
+    long_sl = f_long_sl(close)
+    long_tp = use_tp ? close + (close - long_sl) * rr : na
+    strategy.entry("Long_SMA", strategy.long, comment = "Long_SMA")
+    strategy.exit("Exit Long SMA", "Long_SMA",
+                  stop  = long_sl,
+                  limit = long_tp,
+                  comment = "Exit Long SMA")
     day_count += 1
 
 if short_signal
-    strategy.entry("Short", strategy.short, alert_message = wt_sell)
-    strategy.exit("Short Exit", "Short", stop = short_sl, limit = short_tp, alert_message = wt_cls)
+    short_sl = f_short_sl(close)
+    short_tp = use_tp ? close - (short_sl - close) * rr : na
+    strategy.entry("Short_SMA", strategy.short, comment = "Short_SMA")
+    strategy.exit("Exit Short SMA", "Short_SMA",
+                  stop  = short_sl,
+                  limit = short_tp,
+                  comment = "Exit Short SMA")
     day_count += 1
 
+// Salida por cruce inverso (cierra sin esperar SL/TP)
+if exit_long
+    strategy.close("Long_SMA", comment = "Exit Long SMA")
+
+if exit_short
+    strategy.close("Short_SMA", comment = "Exit Short SMA")
+
 // ─────────────────────────────────────────────────────────────────────────────
-// VISUALES
+// VISUAL — SMAs
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Niveles de liquidez
-col_pdh = color.new(color.red,    25)
-col_pdl = color.new(color.green,  25)
-col_pwh = color.new(color.orange, 15)
-col_pwl = color.new(color.teal,   15)
+plot(show_sma ? sma_fast  : na, "SMA " + str.tostring(sma_fast_len),
+     color.new(color.yellow, 0), 1)
+plot(show_sma ? sma_slow  : na, "SMA " + str.tostring(sma_slow_len),
+     color.new(color.orange, 0), 1)
+plot(show_sma ? sma_trend : na, "SMA " + str.tostring(sma_trend_len),
+     color.new(color.white,  30), 2)
 
-plot(show_lvl and use_pdhl ? pdh : na, "PDH", col_pdh, 1, plot.style_stepline)
-plot(show_lvl and use_pdhl ? pdl : na, "PDL", col_pdl, 1, plot.style_stepline)
-plot(show_lvl and use_pwhl ? pwh : na, "PWH", col_pwh, 2, plot.style_stepline)
-plot(show_lvl and use_pwhl ? pwl : na, "PWL", col_pwl, 2, plot.style_stepline)
+// Relleno entre SMA rápida y lenta
+fast_plot = plot(show_sma ? sma_fast : na, display = display.none)
+slow_plot = plot(show_sma ? sma_slow : na, display = display.none)
+fill(fast_plot, slow_plot,
+     color = sma_fast > sma_slow ? color.new(color.green, 88) : color.new(color.red, 88))
 
-// EQH / EQL — diamantes sobre/bajo la vela
-plotshape(show_lvl and use_eqhl and eqh_hit, "EQH", shape.diamond,
-          location.abovebar, color.new(color.red,   0), size = size.tiny)
-plotshape(show_lvl and use_eqhl and eql_hit, "EQL", shape.diamond,
-          location.belowbar, color.new(color.green, 0), size = size.tiny)
+// ─────────────────────────────────────────────────────────────────────────────
+// VISUAL — Niveles de liquidez PO3
+// ─────────────────────────────────────────────────────────────────────────────
 
-// Sweeps (fondo semitransparente en la vela)
-bgcolor(show_sweep and bull_sweep ? color.new(color.green, 82) : na, title = "Sweep Alcista")
-bgcolor(show_sweep and bear_sweep ? color.new(color.red,   82) : na, title = "Sweep Bajista")
+plot(show_lvl and use_pdhl ? pdh : na, "PDH", color.new(color.red,   25), 1, plot.style_stepline)
+plot(show_lvl and use_pdhl ? pdl : na, "PDL", color.new(color.green, 25), 1, plot.style_stepline)
+plot(show_lvl and use_pwhl ? pwh : na, "PWH", color.new(color.orange,15), 2, plot.style_stepline)
+plot(show_lvl and use_pwhl ? pwl : na, "PWL", color.new(color.teal,  15), 2, plot.style_stepline)
 
-// Marcadores de sweep
-plotshape(show_sweep and bull_sweep, "▲ Sweep Long",
-          shape.triangleup,   location.belowbar, color.new(color.green, 0), size = size.small)
-plotshape(show_sweep and bear_sweep, "▼ Sweep Short",
-          shape.triangledown, location.abovebar, color.new(color.red,   0), size = size.small)
+plotshape(show_lvl and use_eqhl and eqh_hit, "EQH",
+          shape.diamond, location.abovebar, color.new(color.red,   0), size = size.tiny)
+plotshape(show_lvl and use_eqhl and eql_hit, "EQL",
+          shape.diamond, location.belowbar, color.new(color.green, 0), size = size.tiny)
 
-// FVG — fondo de color en la zona
-bgcolor(show_fvg_bg and bull_fvg_new ? color.new(color.lime,  90) : na, title = "FVG Alcista")
-bgcolor(show_fvg_bg and bear_fvg_new ? color.new(color.red,   90) : na, title = "FVG Bajista")
+// ─────────────────────────────────────────────────────────────────────────────
+// VISUAL — Sweeps
+// ─────────────────────────────────────────────────────────────────────────────
 
-// Order Blocks — cajas
-var box bull_ob_bx = na
-var box bear_ob_bx = na
+bgcolor(show_sweep and bull_sweep_now ? color.new(color.green, 85) : na, title = "Bull Sweep")
+bgcolor(show_sweep and bear_sweep_now ? color.new(color.red,   85) : na, title = "Bear Sweep")
 
-if show_ob_box and bob_ok
-    box.delete(bull_ob_bx)
-    bull_ob_bx := box.new(bar_index - ob_look, bob_hi, bar_index + 4, bob_lo,
-                          border_color = color.new(color.teal,   10),
-                          bgcolor      = color.new(color.teal,   82),
-                          border_width = 1)
+plotshape(show_sweep and bull_sweep_now, "▲ Bull Sweep",
+          shape.triangleup,   location.belowbar, color.new(color.lime, 0), size = size.small)
+plotshape(show_sweep and bear_sweep_now, "▼ Bear Sweep",
+          shape.triangledown, location.abovebar, color.new(color.red,  0), size = size.small)
 
-if show_ob_box and soo_ok
-    box.delete(bear_ob_bx)
-    bear_ob_bx := box.new(bar_index - ob_look, soo_hi, bar_index + 4, soo_lo,
-                          border_color = color.new(color.orange, 10),
-                          bgcolor      = color.new(color.orange, 82),
-                          border_width = 1)
+// ─────────────────────────────────────────────────────────────────────────────
+// VISUAL — Etiquetas de entrada
+// ─────────────────────────────────────────────────────────────────────────────
 
-// Etiquetas de entrada
 if long_signal and show_lbl
+    long_sl_lbl = f_long_sl(close)
+    long_tp_lbl = use_tp ? close + (close - long_sl_lbl) * rr : na
     label.new(bar_index, low,
-              "▲ LONG PO3\n" + bull_conf_lbl +
-              "\nSL " + str.tostring(math.round(long_sl,  2)) +
-              "  TP " + str.tostring(math.round(long_tp,  2)),
+              "▲ LONG\nSMA" + str.tostring(sma_fast_len) + "×SMA" + str.tostring(sma_slow_len) +
+              (use_po3 and bull_sweep_recent ? " + PO3" : "") +
+              "\nSL " + str.tostring(math.round(long_sl_lbl, 0)) +
+              (use_tp ? "  TP " + str.tostring(math.round(long_tp_lbl, 0)) : ""),
               style     = label.style_label_up,
               color     = color.new(color.green, 5),
               textcolor = color.white,
-              size      = size.normal)
+              size      = size.small)
 
 if short_signal and show_lbl
+    short_sl_lbl = f_short_sl(close)
+    short_tp_lbl = use_tp ? close - (short_sl_lbl - close) * rr : na
     label.new(bar_index, high,
-              "▼ SHORT PO3\n" + bear_conf_lbl +
-              "\nSL " + str.tostring(math.round(short_sl, 2)) +
-              "  TP " + str.tostring(math.round(short_tp, 2)),
+              "▼ SHORT\nSMA" + str.tostring(sma_fast_len) + "×SMA" + str.tostring(sma_slow_len) +
+              (use_po3 and bear_sweep_recent ? " + PO3" : "") +
+              "\nSL " + str.tostring(math.round(short_sl_lbl, 0)) +
+              (use_tp ? "  TP " + str.tostring(math.round(short_tp_lbl, 0)) : ""),
               style     = label.style_label_down,
               color     = color.new(color.red,   5),
               textcolor = color.white,
-              size      = size.normal)
+              size      = size.small)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TABLA DE ESTADO — esquina superior derecha
+// TABLA DE ESTADO
 // ─────────────────────────────────────────────────────────────────────────────
 
-var table info = table.new(position.top_right, 2, 6,
+var table t = table.new(position.top_right, 2, 7,
      bgcolor      = color.new(color.black, 70),
-     border_color = color.new(color.gray, 50),
+     border_color = color.new(color.gray,  50),
      border_width = 1,
-     frame_color  = color.new(color.gray, 40),
+     frame_color  = color.new(color.gray,  40),
      frame_width  = 1)
 
-cell(r, c, txt, tc) =>
-    table.cell(info, c, r, txt, text_color = tc, text_size = size.small)
+tc(row, col, txt, clr) =>
+    table.cell(t, col, row, txt, text_color = clr, text_size = size.small)
 
-cell(0, 0, "PO3 4H BTC/USDC",  color.white)
-cell(0, 1, timeframe.period + "H · " + syminfo.exchange, color.silver)
-cell(1, 0, "Vol Inst.", color.silver)
-cell(1, 1, inst_vol ? "✔ SÍ" : "—", inst_vol ? color.lime : color.gray)
-cell(2, 0, "Bull Sweep", color.silver)
-cell(2, 1, bull_sweep ? "✔ ACTIVO" : "—", bull_sweep ? color.lime : color.gray)
-cell(3, 0, "Bear Sweep", color.silver)
-cell(3, 1, bear_sweep ? "✔ ACTIVO" : "—", bear_sweep ? color.red  : color.gray)
-cell(4, 0, "Confluencia", color.silver)
-cell(4, 1, bull_conf ? "OB/FVG Long" : bear_conf ? "OB/FVG Short" : "—",
-     bull_conf ? color.lime : bear_conf ? color.red : color.gray)
-cell(5, 0, "Trades hoy", color.silver)
-cell(5, 1, str.tostring(day_count) + "/" + str.tostring(max_day_tr),
-     day_count >= max_day_tr ? color.red : color.lime)
+pos_size   = strategy.position_size
+in_long    = pos_size > 0
+in_short   = pos_size < 0
+pos_str    = in_long ? "▲ LONG" : in_short ? "▼ SHORT" : "—"
+pos_col    = in_long ? color.lime : in_short ? color.red : color.gray
+trend_str  = close > sma_trend ? "▲ Alcista" : "▼ Bajista"
+trend_col  = close > sma_trend ? color.lime  : color.red
+align_str  = sma_fast > sma_slow ? "Fast > Slow ▲" : "Fast < Slow ▼"
+align_col  = sma_fast > sma_slow ? color.lime : color.red
+
+tc(0, 0, "PO3 SMA · BTC/USDC",            color.white)
+tc(0, 1, timeframe.period,                 color.silver)
+tc(1, 0, "Tendencia SMA" + str.tostring(sma_trend_len), color.silver)
+tc(1, 1, trend_str,                        trend_col)
+tc(2, 0, "Alineación SMA",                 color.silver)
+tc(2, 1, align_str,                        align_col)
+tc(3, 0, "PO3 Bull",                       color.silver)
+tc(3, 1, bull_sweep_recent ? "✔ Activo" : "—",
+         bull_sweep_recent ? color.lime : color.gray)
+tc(4, 0, "PO3 Bear",                       color.silver)
+tc(4, 1, bear_sweep_recent ? "✔ Activo" : "—",
+         bear_sweep_recent ? color.red  : color.gray)
+tc(5, 0, "Posición",                       color.silver)
+tc(5, 1, pos_str,                          pos_col)
+tc(6, 0, "Trades hoy",                     color.silver)
+tc(6, 1, str.tostring(day_count) + " / " + str.tostring(max_day),
+         day_count >= max_day ? color.red : color.lime)
