@@ -1,0 +1,463 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// © rpmnode
+//
+// ══════════════════════════════════════════════════════════════════════════════
+//  CRT 4H MULTI-ASSET  ·  BTC/USDC · SP500 · Gold
+//  Candle Range Theory — Flujo Institucional
+//
+//  Metodologías combinadas:
+//   · WillStreet_fx    — Previous Candle Purge · Ventana 05:00 EST · Failure Swing
+//   · Cluti_fx         — CRT puro: sweep + cierre dentro del rango anterior
+//   · Hotmarketguy     — Zonas OTE Fibonacci 61.8% · 50% Equilibrio
+//   · Hobietrader      — CHoCH post-sweep (desplazamiento >50% EQ)
+//   · Michael Automates — Automatización via WunderTrading webhook
+//
+//  CONFIGURACIÓN WUNDERTRADING → TRADINGVIEW → EXCHANGE
+//  ─────────────────────────────────────────────────────
+//  1. WunderTrading → Mis Bots → Nuevo Bot → Exchange → Par (BTC/USDC, SPX, XAU)
+//  2. Copia el "Bot Secret Key" → pégalo en el input "Bot Secret Key"
+//  3. TradingView → Alertas → Nueva alerta sobre este script
+//       · Condición : CRT 4H — cualquier alerta
+//       · Mensaje   : {{strategy.order.alert_message}}
+//       · Webhook   : https://wundertrading.com/api/v1/bots/{TU_BOT_ID}/signals
+//
+//  TIMEFRAME RECOMENDADO: 4H
+//  ACTIVOS:  BTCUSDC (Binance) · ES1! / SPX · XAUUSD
+// ══════════════════════════════════════════════════════════════════════════════
+
+//@version=5
+strategy(
+    title             = "CRT 4H  ·  BTC / SP500 / Gold  |  Multi-Asset",
+    shorttitle        = "CRT 4H",
+    overlay           = true,
+    pyramiding        = 0,
+    default_qty_type  = strategy.percent_of_equity,
+    default_qty_value = 100,
+    initial_capital   = 10_000,
+    commission_type   = strategy.commission.percent,
+    commission_value  = 0.05,
+    slippage          = 2)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+var GW = "⚡ WunderTrading"
+wt_key    = input.string("TU_BOT_SECRET_KEY", "Bot Secret Key", group = GW,
+              tooltip = "Pega el Secret Key del bot de WunderTrading.\nNo compartas el gráfico público con esta clave visible.")
+wt_amount = input.float(100.0, "% Capital por operación", minval = 1, maxval = 100, step = 1, group = GW)
+
+var GA = "📊 Activo"
+asset_type = input.string("Crypto", "Tipo de activo",
+               options = ["Crypto", "Índices", "Metales"], group = GA,
+               tooltip = "Ajusta ventana de sesión y SMA automáticamente según el instrumento.\nCrypto = BTC/USDC · Índices = SP500 · Metales = Gold")
+
+var GS = "⏰ Sesión CRT"
+use_session   = input.bool(true,  "Filtrar por ventana horaria", group = GS)
+crt_window_on = input.bool(true,  "Ventana CRT clásica (WillStreet_fx / Cluti_fx)", group = GS,
+                 tooltip = "Solo busca setups en la vela 4H clave:\n· Crypto  → 05:00 EST  (apertura Londres)\n· Índices → 09:00 EST  (apertura NY)\n· Metales → 08:00 EST  (solapamiento Londres/NY)")
+
+var GC = "🕯️ CRT — Candle Range Theory"
+use_choch      = input.bool(true,  "CHoCH: desplazamiento >50% EQ (Hobietrader)", group = GC,
+                  tooltip = "Exige que el cierre de la vela de sweep supere el punto medio del rango anterior.\nConfirma cambio de carácter institucional (Change of Character).")
+use_fail_swing = input.bool(false, "Failure Swing — sin sweep previo (WillStreet)", group = GC,
+                  tooltip = "Entrada en continuación cuando el precio NO necesita barrer el extremo anterior.\nActivar solo si se entiende bien el concepto.")
+use_crt_tp     = input.bool(true,  "TP = extremo opuesto del CRT", group = GC,
+                  tooltip = "El target es el High anterior (long) o el Low anterior (short).\nSi el target CRT es peor que el R:R mínimo, usa el R:R automáticamente.")
+
+var GOB = "🎯 Confluencia OB / FVG"
+use_ob      = input.bool(true,  "Order Block", group = GOB)
+use_fvg     = input.bool(true,  "Fair Value Gap", group = GOB)
+need_conf   = input.bool(false, "Exigir OB o FVG para entrar", group = GOB,
+               tooltip = "Cuando está activo, solo entra si el precio está dentro de un OB o FVG válido en el momento del sweep.")
+ob_look     = input.int(3,      "Lookback Order Block (barras)", minval = 1, maxval = 10, group = GOB)
+fvg_min_pct = input.float(0.05, "FVG mínimo (%)", minval = 0.0, step = 0.01, group = GOB)
+
+var GT = "📈 Tendencia"
+use_trend  = input.bool(true, "Filtro de tendencia (SMA)", group = GT,
+              tooltip = "Solo longs si close > SMA · Solo shorts si close < SMA")
+sma_period = input.int(200,   "Período SMA", minval = 20, maxval = 500, group = GT)
+
+var GV = "📦 Volumen"
+use_vol  = input.bool(true,  "Volumen institucional", group = GV,
+            tooltip = "El volumen de la vela de sweep debe superar N × la media.\nConfirma absorción real de liquidez.")
+vol_mult = input.float(1.8,  "Multiplicador volumen (×SMA)", minval = 1.0, step = 0.1, group = GV)
+vol_len  = input.int(20,     "Período SMA volumen", minval = 5, group = GV)
+
+var GR = "🛡️ Riesgo"
+atr_len     = input.int(14,   "Período ATR", minval = 5, group = GR)
+sl_atr_mult = input.float(1.0, "Multiplicador SL (×ATR)", minval = 0.1, step = 0.1, group = GR,
+               tooltip = "SL = extremo del sweep ± 1×ATR.\nATR dinámico se adapta a la volatilidad del activo.")
+rr          = input.float(2.0, "Risk:Reward mínimo", minval = 0.5, step = 0.5, group = GR,
+               tooltip = "Usado cuando el TP CRT no alcanza este R:R, o cuando TP CRT está desactivado.")
+max_day_tr  = input.int(1,    "Máx. entradas por día", minval = 1, maxval = 3, group = GR)
+
+var GVis = "🎨 Visual"
+show_crt_box = input.bool(true, "Caja rango CRT (vela anterior)", group = GVis)
+show_eq_line = input.bool(true, "Línea 50% EQ (Hotmarketguy)", group = GVis)
+show_ote_lvl = input.bool(true, "Nivel 61.8% OTE (Hotmarketguy)", group = GVis)
+show_fvg_bg  = input.bool(true, "Zonas FVG", group = GVis)
+show_ob_box  = input.bool(true, "Cajas Order Block", group = GVis)
+show_sess_bg = input.bool(true, "Fondo ventana CRT", group = GVis)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SESIÓN Y VENTANA CRT
+// ─────────────────────────────────────────────────────────────────────────────
+
+et_hour = hour(time, "America/New_York")
+
+// Ventanas de sesión activa por activo (en hora ET)
+in_sess_crypto  = et_hour >= 1  and et_hour < 9    // Asia final + Londres
+in_sess_indices = et_hour >= 9  and et_hour < 17   // RTH SP500
+in_sess_metals  = et_hour >= 3  and et_hour < 14   // Londres + NY overlap
+
+in_sess_raw = asset_type == "Crypto"  ? in_sess_crypto  :
+              asset_type == "Índices" ? in_sess_indices :
+              in_sess_metals
+in_session  = not use_session or in_sess_raw
+
+// Vela 4H "señal" por activo (WillStreet_fx modelo CRT):
+//   Crypto  → 05:00 EST: setup más limpio antes de NY (Cluti_fx / WillStreet)
+//   Índices → 09:00 EST: NY open, primera vela 4H del día
+//   Metales → 08:00 EST: solapamiento Londres/NY, mayor volumen
+crt_hour = asset_type == "Crypto"  ? 5 :
+           asset_type == "Índices" ? 9 :
+           8
+in_crt_window = not crt_window_on or et_hour == crt_hour
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CRT — REFERENCIA: VELA ANTERIOR 4H
+// ─────────────────────────────────────────────────────────────────────────────
+// Cuando estamos en la vela 05:00 EST, high[1]/low[1] son exactamente
+// los niveles de la vela 01:00 EST — el setup CRT clásico de WillStreet_fx.
+
+ref_high = high[1]
+ref_low  = low[1]
+ref_range = ref_high - ref_low
+
+ref_mid  = ref_low  + ref_range * 0.50   // 50% EQ  (Hotmarketguy)
+ref_ote  = ref_low  + ref_range * 0.382  // 61.8% OTE bull (Hotmarketguy, Fibonacci)
+ref_ote_b = ref_high - ref_range * 0.382 // 61.8% OTE bear
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SWEEP — PREVIOUS CANDLE PURGE (WillStreet_fx / Cluti_fx)
+// ─────────────────────────────────────────────────────────────────────────────
+// Bull: la vela actual barre el LOW anterior y cierra DE VUELTA dentro del rango
+// Bear: la vela actual barre el HIGH anterior y cierra DE VUELTA dentro del rango
+
+bull_purge = low  < ref_low  and close > ref_low   // stop hunt bajista → intención alcista
+bear_purge = high > ref_high and close < ref_high  // stop hunt alcista  → intención bajista
+
+// Failure Swing (WillStreet_fx): continuación sin necesidad de sweep previo
+// El precio muestra desplazamiento fuera del rango anterior sin haber barrido el extremo
+fail_bull = use_fail_swing and close > ref_high and low  >= ref_low
+fail_bear = use_fail_swing and close < ref_low  and high <= ref_high
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CHoCH — CAMBIO DE CARÁCTER (Hobietrader)
+// El cierre debe superar el 50% del rango anterior (desplazamiento institucional)
+// ─────────────────────────────────────────────────────────────────────────────
+
+choch_bull = not use_choch or close > ref_mid   // absorción bajista + flip alcista
+choch_bear = not use_choch or close < ref_mid   // absorción alcista  + flip bajista
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VOLUMEN INSTITUCIONAL
+// ─────────────────────────────────────────────────────────────────────────────
+
+vol_avg  = ta.sma(volume, vol_len)
+inst_vol = not use_vol or volume >= vol_avg * vol_mult
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TENDENCIA — SMA
+// ─────────────────────────────────────────────────────────────────────────────
+
+sma        = ta.sma(close, sma_period)
+trend_long = not use_trend or close > sma
+trend_shrt = not use_trend or close < sma
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ATR (Stop Loss dinámico)
+// ─────────────────────────────────────────────────────────────────────────────
+
+atr = ta.atr(atr_len)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FAIR VALUE GAPS
+// ─────────────────────────────────────────────────────────────────────────────
+
+fvg_sz       = fvg_min_pct / 100 * close
+bull_fvg_new = close[1] > open[1] and low  > high[2] and (low  - high[2]) >= fvg_sz
+bear_fvg_new = close[1] < open[1] and high < low[2]  and (low[2] - high)  >= fvg_sz
+
+var float bfvg_lo = na
+var float bfvg_hi = na
+var bool  bfvg_ok = false
+var float sfvg_lo = na
+var float sfvg_hi = na
+var bool  sfvg_ok = false
+
+if bull_fvg_new
+    bfvg_lo := high[2]
+    bfvg_hi := low
+    bfvg_ok := true
+if bear_fvg_new
+    sfvg_lo := high
+    sfvg_hi := low[2]
+    sfvg_ok := true
+if bfvg_ok and low  < bfvg_lo
+    bfvg_ok := false
+if sfvg_ok and high > sfvg_hi
+    sfvg_ok := false
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ORDER BLOCKS
+// ─────────────────────────────────────────────────────────────────────────────
+
+bull_imp = close > open and close > close[1] * 1.002
+bear_imp = close < open and close < close[1] * 0.998
+
+var float bob_lo = na
+var float bob_hi = na
+var bool  bob_ok = false
+var float soo_lo = na
+var float soo_hi = na
+var bool  soo_ok = false
+
+if use_ob
+    if bull_imp and close[ob_look] < open[ob_look]
+        bob_lo := close[ob_look]
+        bob_hi := open[ob_look]
+        bob_ok := true
+    if bear_imp and close[ob_look] > open[ob_look]
+        soo_lo := open[ob_look]
+        soo_hi := close[ob_look]
+        soo_ok := true
+if bob_ok and low  < bob_lo
+    bob_ok := false
+if soo_ok and high > soo_hi
+    soo_ok := false
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONFLUENCIA OB / FVG
+// ─────────────────────────────────────────────────────────────────────────────
+
+bull_ob_in  = use_ob  and bob_ok  and close >= bob_lo  and close <= bob_hi
+bull_fvg_in = use_fvg and bfvg_ok and close >= bfvg_lo and close <= bfvg_hi
+bear_ob_in  = use_ob  and soo_ok  and close >= soo_lo  and close <= soo_hi
+bear_fvg_in = use_fvg and sfvg_ok and close >= sfvg_lo and close <= sfvg_hi
+
+bull_conf = bull_ob_in or bull_fvg_in
+bear_conf = bear_ob_in or bear_fvg_in
+
+conf_lbl_l = bull_ob_in ? "OB" : bull_fvg_in ? "FVG" : "CRT"
+conf_lbl_s = bear_ob_in ? "OB" : bear_fvg_in ? "FVG" : "CRT"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONTROL DIARIO
+// ─────────────────────────────────────────────────────────────────────────────
+
+var int day_count = 0
+var int prev_day  = 0
+cur_day = dayofmonth + month * 31 + year * 366
+if cur_day != prev_day
+    day_count := 0
+    prev_day  := cur_day
+
+can_enter = strategy.position_size == 0 and day_count < max_day_tr
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SEÑALES FINALES
+// ─────────────────────────────────────────────────────────────────────────────
+
+qual_long  = (bull_purge or fail_bull) and choch_bull and inst_vol
+             and trend_long and in_session and in_crt_window
+qual_short = (bear_purge or fail_bear) and choch_bear and inst_vol
+             and trend_shrt and in_session and in_crt_window
+
+long_sig  = can_enter and qual_long  and (not need_conf or bull_conf)
+short_sig = can_enter and qual_short and (not need_conf or bear_conf)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SL / TP
+// ─────────────────────────────────────────────────────────────────────────────
+
+// SL: más allá del extremo barrido + colchón ATR
+long_sl  = math.min(low, ref_low)  - atr * sl_atr_mult
+short_sl = math.max(high, ref_high) + atr * sl_atr_mult
+
+// TP: extremo opuesto del CRT (objetivo natural) — si no alcanza el R:R mínimo, usa R:R
+long_tp_rr  = close + (close - long_sl)  * rr
+short_tp_rr = close - (short_sl - close) * rr
+
+long_tp_crt  = ref_high
+short_tp_crt = ref_low
+
+long_tp  = use_crt_tp ? (ref_high > close ? ref_high : long_tp_rr)  : long_tp_rr
+short_tp = use_crt_tp ? (ref_low  < close ? ref_low  : short_tp_rr) : short_tp_rr
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WEBHOOK JSON — WUNDERTRADING
+// ─────────────────────────────────────────────────────────────────────────────
+
+wt_buy = '{"key":"' + wt_key + '","message":"open_long","amount_type":"percent","amount":'
+         + str.tostring(wt_amount, "#") + '}'
+wt_sel = '{"key":"' + wt_key + '","message":"open_short","amount_type":"percent","amount":'
+         + str.tostring(wt_amount, "#") + '}'
+wt_cls = '{"key":"' + wt_key + '","message":"close_position"}'
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ÓRDENES
+// ─────────────────────────────────────────────────────────────────────────────
+
+if long_sig
+    strategy.entry("Long",  strategy.long,  alert_message = wt_buy)
+    strategy.exit ("LX",    "Long",  stop = long_sl,  limit = long_tp,  alert_message = wt_cls)
+    day_count += 1
+
+if short_sig
+    strategy.entry("Short", strategy.short, alert_message = wt_sel)
+    strategy.exit ("SX",    "Short", stop = short_sl, limit = short_tp, alert_message = wt_cls)
+    day_count += 1
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VISUALES
+// ─────────────────────────────────────────────────────────────────────────────
+
+// — CRT Range Box: muestra el rango de la vela anterior en cada bar
+var box crt_box = na
+if show_crt_box and barstate.isconfirmed
+    box.delete(crt_box)
+    b_col = long_sig   ? color.new(color.green,  70) :
+            short_sig  ? color.new(color.red,    70) :
+            bull_purge ? color.new(color.lime,   88) :
+            bear_purge ? color.new(color.orange, 88) :
+            color.new(color.gray, 93)
+    crt_box := box.new(
+         bar_index - 1, ref_high, bar_index + 3, ref_low,
+         border_color = color.new(color.gray, 60),
+         bgcolor      = b_col,
+         border_width = 1)
+
+// — 50% EQ (Hotmarketguy — zona de equilibrio del rango)
+plot(show_eq_line ? ref_mid : na, "50% EQ",
+     color.new(color.silver, 40), 1, plot.style_circles)
+
+// — 61.8% OTE (Hotmarketguy — zona de entrada óptima)
+plot(show_ote_lvl and bull_purge ? ref_ote   : na, "OTE Bull 61.8%",
+     color.new(color.aqua, 30), 1, plot.style_cross)
+plot(show_ote_lvl and bear_purge ? ref_ote_b : na, "OTE Bear 61.8%",
+     color.new(color.fuchsia, 30), 1, plot.style_cross)
+
+// — SMA tendencia
+plot(use_trend ? sma : na, "SMA " + str.tostring(sma_period),
+     color.new(color.yellow, 40), 2)
+
+// — Marcadores de purge (sweep sin señal completa)
+plotshape(bull_purge and not long_sig,  "Purge ▲",
+          shape.triangleup,   location.belowbar, color.new(color.lime, 50), size = size.tiny)
+plotshape(bear_purge and not short_sig, "Purge ▼",
+          shape.triangledown, location.abovebar, color.new(color.red,  50), size = size.tiny)
+
+// — Señal completa (grande)
+plotshape(long_sig,  "▲ CRT LONG",
+          shape.triangleup,   location.belowbar, color.new(color.green, 0), size = size.normal)
+plotshape(short_sig, "▼ CRT SHORT",
+          shape.triangledown, location.abovebar, color.new(color.red,   0), size = size.normal)
+
+// — Labels con niveles SL/TP
+if long_sig
+    label.new(bar_index, low,
+              "▲ CRT LONG  [" + conf_lbl_l + "]\n" +
+              "SL " + str.tostring(math.round(long_sl,  2)) +
+              "  TP " + str.tostring(math.round(long_tp, 2)),
+              style     = label.style_label_up,
+              color     = color.new(color.green, 5),
+              textcolor = color.white,
+              size      = size.small)
+
+if short_sig
+    label.new(bar_index, high,
+              "▼ CRT SHORT  [" + conf_lbl_s + "]\n" +
+              "SL " + str.tostring(math.round(short_sl,  2)) +
+              "  TP " + str.tostring(math.round(short_tp, 2)),
+              style     = label.style_label_down,
+              color     = color.new(color.red, 5),
+              textcolor = color.white,
+              size      = size.small)
+
+// — FVG zonas (fondo semitransparente)
+bgcolor(show_fvg_bg and bull_fvg_new ? color.new(color.lime, 90) : na, title = "FVG Alcista")
+bgcolor(show_fvg_bg and bear_fvg_new ? color.new(color.red,  90) : na, title = "FVG Bajista")
+
+// — Order Block boxes
+var box bull_ob_bx = na
+var box bear_ob_bx = na
+
+if show_ob_box and bob_ok
+    box.delete(bull_ob_bx)
+    bull_ob_bx := box.new(bar_index - ob_look, bob_hi, bar_index + 4, bob_lo,
+                          border_color = color.new(color.teal,   10),
+                          bgcolor      = color.new(color.teal,   82),
+                          border_width = 1)
+if show_ob_box and soo_ok
+    box.delete(bear_ob_bx)
+    bear_ob_bx := box.new(bar_index - ob_look, soo_hi, bar_index + 4, soo_lo,
+                          border_color = color.new(color.orange, 10),
+                          bgcolor      = color.new(color.orange, 82),
+                          border_width = 1)
+
+// — Fondo de ventana CRT activa
+sess_col = asset_type == "Crypto"  ? color.new(color.blue,   96) :
+           asset_type == "Índices" ? color.new(color.purple, 96) :
+           color.new(color.orange, 96)
+bgcolor(show_sess_bg and in_session and in_crt_window ? sess_col : na, title = "Ventana CRT")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TABLA DE ESTADO — esquina superior derecha
+// ─────────────────────────────────────────────────────────────────────────────
+
+var table tbl = table.new(position.top_right, 2, 10,
+     bgcolor      = color.new(color.black, 70),
+     border_color = color.new(color.gray,  50),
+     border_width = 1,
+     frame_color  = color.new(color.gray,  40),
+     frame_width  = 1)
+
+f_cell(r, c, txt, tc) =>
+    table.cell(tbl, c, r, txt, text_color = tc, text_size = size.small)
+
+f_cell(0, 0, "CRT 4H  ·  " + syminfo.ticker,      color.white)
+f_cell(0, 1, asset_type + "  " + timeframe.period + "H", color.silver)
+
+f_cell(1, 0, "Ventana CRT", color.silver)
+f_cell(1, 1, in_session and in_crt_window ? "✔ ACTIVA" : "— fuera",
+             in_session and in_crt_window ? color.lime : color.gray)
+
+f_cell(2, 0, "Tendencia", color.silver)
+f_cell(2, 1, close > sma ? "▲ ALCISTA" : "▼ BAJISTA",
+             close > sma ? color.lime : color.red)
+
+f_cell(3, 0, "Bull Purge", color.silver)
+f_cell(3, 1, bull_purge ? "✔ SWEEP ▲" : "—", bull_purge ? color.lime : color.gray)
+
+f_cell(4, 0, "Bear Purge", color.silver)
+f_cell(4, 1, bear_purge ? "✔ SWEEP ▼" : "—", bear_purge ? color.red : color.gray)
+
+f_cell(5, 0, "CHoCH", color.silver)
+f_cell(5, 1, (bull_purge and choch_bull) or (bear_purge and choch_bear) ? "✔ CONF" : "—",
+             (bull_purge and choch_bull) or (bear_purge and choch_bear) ? color.lime : color.gray)
+
+f_cell(6, 0, "Vol Inst.", color.silver)
+f_cell(6, 1, inst_vol ? "✔ SÍ" : "—", inst_vol ? color.lime : color.gray)
+
+f_cell(7, 0, "Confluencia", color.silver)
+f_cell(7, 1, bull_conf ? "OB/FVG ▲" : bear_conf ? "OB/FVG ▼" : "—",
+             bull_conf ? color.lime   : bear_conf ? color.red  : color.gray)
+
+f_cell(8, 0, "ATR", color.silver)
+f_cell(8, 1, str.tostring(math.round(atr, 2)), color.silver)
+
+f_cell(9, 0, "Trades hoy", color.silver)
+f_cell(9, 1, str.tostring(day_count) + "/" + str.tostring(max_day_tr),
+             day_count >= max_day_tr ? color.red : color.lime)
