@@ -1,35 +1,38 @@
 """
 PO3 Strategy Backtest — BTC/USDT 1H | Jan 2017 – Dec 2021
-Replica exacta de la lógica del PO3_Strategy.pine
+Replica exacta de la lógica del PO3_Strategy.pine + optimizaciones v2
 """
 
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone
+from itertools import product
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PARÁMETROS (espejo del PineScript)
+# PARÁMETROS BASE
 # ─────────────────────────────────────────────────────────────────────────────
-PARAMS = dict(
+BASE_PARAMS = dict(
     use_pdhl     = True,
     use_pwhl     = True,
     use_eqhl     = True,
     eq_look      = 10,
-    eq_tol       = 0.15,      # %
+    eq_tol       = 0.15,
     vol_mult     = 1.5,
     vol_len      = 20,
-    wick_min_pct = 0.20,      # %
+    wick_min_pct = 0.20,
     use_ob       = True,
     use_fvg      = True,
     need_conf    = False,
     ob_look      = 3,
-    fvg_min_pct  = 0.05,      # %
+    fvg_min_pct  = 0.05,
     rr           = 2.5,
-    sl_buf_pct   = 0.10,      # %
+    sl_buf_pct   = 0.10,
     max_day_tr   = 2,
-    commission   = 0.05,      # % por lado (Binance spot maker/taker)
-    initial_cap  = 10_000,    # USDT
-    qty_pct      = 100,       # % equity por operación
+    trend_filter = False,     # NUEVO: solo longs en uptrend / shorts en downtrend
+    trend_period = 200,       # NUEVO: SMA período (en barras 1H)
+    commission   = 0.05,
+    initial_cap  = 10_000,
+    qty_pct      = 100,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -154,6 +157,11 @@ def add_indicators(df, p):
     df["upper_wick"] = h - np.maximum(o, c)
     df["bull_wick_ok"] = df["lower_wick"] >= pct(p["wick_min_pct"], l)
     df["bear_wick_ok"] = df["upper_wick"] >= pct(p["wick_min_pct"], h)
+
+    # Trend filter: SMA sobre cierre
+    df["sma_trend"] = c.rolling(p["trend_period"]).mean()
+    df["uptrend"]   = c > df["sma_trend"]
+    df["downtrend"] = c < df["sma_trend"]
 
     return df
 
@@ -313,10 +321,16 @@ def run_backtest(df, p):
         bull_conf = bull_ob_in or bull_fvg_in
         bear_conf = bear_ob_in or bear_fvg_in
 
+        # ── Filtro de tendencia ──────────────────────────────────────────────
+        uptrend   = row["uptrend"]
+        downtrend = row["downtrend"]
+        trend_ok_long  = (not p["trend_filter"]) or uptrend
+        trend_ok_short = (not p["trend_filter"]) or downtrend
+
         # ── Señales ──────────────────────────────────────────────────────────
         can_enter    = position is None and day_count < p["max_day_tr"]
-        long_signal  = can_enter and bull_sweep and (not p["need_conf"] or bull_conf)
-        short_signal = can_enter and bear_sweep and (not p["need_conf"] or bear_conf)
+        long_signal  = can_enter and bull_sweep and trend_ok_long  and (not p["need_conf"] or bull_conf)
+        short_signal = can_enter and bear_sweep and trend_ok_short and (not p["need_conf"] or bear_conf)
 
         if long_signal:
             sl = l  - pct(p["sl_buf_pct"], l)
@@ -420,15 +434,134 @@ def metrics(trades, initial_cap):
         "profit_factor": profit_fac,
         "max_dd": max_dd,
         "sharpe": sharpe,
+        "by_year": by_year,
     }
+
+def print_result(r, label, initial_cap, trades):
+    eq   = trades["equity"]
+    wins = trades[trades["pnl"] > 0]
+    loss = trades[trades["pnl"] <= 0]
+    print("\n" + "═"*62)
+    print(f"  {label}")
+    print("═"*62)
+    print(f"  Capital inicial      : ${initial_cap:>12,.2f}")
+    print(f"  Capital final        : ${r['final_equity']:>12,.2f}")
+    print(f"  Retorno total        : {r['total_return_pct']:>+11.2f}%")
+    print(f"  Total operaciones    : {r['n_trades']:>12,}")
+    print(f"  Win Rate             : {r['win_rate']:>11.1f}%")
+    print(f"  Avg ganadora         : {wins['pnl_pct'].mean() if len(wins) else 0:>+11.2f}%")
+    print(f"  Avg perdedora        : {loss['pnl_pct'].mean() if len(loss) else 0:>+11.2f}%")
+    print(f"  Profit Factor        : {r['profit_factor']:>12.2f}")
+    print(f"  Expectancy / trade   : ${trades['pnl'].mean():>11.2f}")
+    print(f"  Max Drawdown         : {r['max_dd']:>+11.2f}%")
+    print(f"  Sharpe (aprox)       : {r['sharpe']:>12.2f}")
+    print(f"  TP hits              : {len(trades[trades['result']=='TP']):>12,}")
+    print(f"  SL hits              : {len(trades[trades['result']=='SL']):>12,}")
+    print("─"*62)
+    print("  RESULTADOS POR AÑO")
+    print("─"*62)
+    for yr, row in r["by_year"].iterrows():
+        print(f"  {yr}  |  {int(row.trades_n):>4} trades  |  "
+              f"PnL ${row.net_pnl:>+10,.2f}  |  WR {row.wr:>5.1f}%")
+    print("═"*62)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GRID DE OPTIMIZACIÓN
+# ─────────────────────────────────────────────────────────────────────────────
+
+GRID = {
+    "need_conf":    [False, True],
+    "vol_mult":     [1.5, 2.0, 2.5],
+    "trend_filter": [False, True],
+    "max_day_tr":   [1, 2],
+    "wick_min_pct": [0.20, 0.35],
+}
+
+def run_grid(df_raw, base):
+    keys   = list(GRID.keys())
+    combos = list(product(*[GRID[k] for k in keys]))
+    results = []
+    print(f"\nOptimizando {len(combos)} combinaciones...", flush=True)
+    for combo in combos:
+        p = {**base}
+        for k, v in zip(keys, combo):
+            p[k] = v
+        # re-calcular inst_vol y trend con nuevos params
+        df = df_raw.copy()
+        df["vol_avg"]  = df["volume"].rolling(p["vol_len"]).mean()
+        df["inst_vol"] = df["volume"] >= df["vol_avg"] * p["vol_mult"]
+        df["lower_wick"] = np.minimum(df.open, df.close) - df.low
+        df["upper_wick"] = df.high - np.maximum(df.open, df.close)
+        df["bull_wick_ok"] = df["lower_wick"] >= pct(p["wick_min_pct"], df.low)
+        df["bear_wick_ok"] = df["upper_wick"] >= pct(p["wick_min_pct"], df.high)
+        df["sma_trend"] = df["close"].rolling(p["trend_period"]).mean()
+        df["uptrend"]   = df["close"] > df["sma_trend"]
+        df["downtrend"] = df["close"] < df["sma_trend"]
+        t = run_backtest(df, p)
+        if t.empty:
+            continue
+        eq  = t["equity"]
+        win = (t["pnl"] > 0).mean() * 100
+        pf  = t[t["pnl"]>0]["pnl"].sum() / abs(t[t["pnl"]<=0]["pnl"].sum() + 1e-9)
+        ret = (eq.iloc[-1] - p["initial_cap"]) / p["initial_cap"] * 100
+        peak = eq.cummax(); dd = ((eq - peak)/peak*100).min()
+        results.append({**dict(zip(keys, combo)),
+                        "n_trades": len(t), "win_rate": win,
+                        "profit_factor": pf, "return_pct": ret,
+                        "max_dd": dd, "trades_df": t})
+    return pd.DataFrame([{k:v for k,v in r.items() if k!="trades_df"} for r in results]), results
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    df = fetch_ohlcv("BTC/USDT", "1h", "2017-01-01", "2022-01-01")
-    df = add_indicators(df, PARAMS)
-    trades = run_backtest(df, PARAMS)
-    trades.to_csv("/home/user/TV/backtest_trades.csv", index=False)
-    metrics(trades, PARAMS["initial_cap"])
+    # 1. Generar datos base
+    df_raw = fetch_ohlcv("BTC/USDT", "1h", "2017-01-01", "2022-01-01")
+    df_base = add_indicators(df_raw, BASE_PARAMS)
+
+    # 2. Baseline (parámetros originales)
+    print("\n[1/3] Corriendo baseline (parámetros originales)...")
+    t_base = run_backtest(df_base, BASE_PARAMS)
+    r_base = metrics(t_base, BASE_PARAMS["initial_cap"])
+    print_result(r_base, "BASELINE — Parámetros originales", BASE_PARAMS["initial_cap"], t_base)
+
+    # 3. Optimizado v2: need_conf + vol_mult 2.0 + trend_filter
+    p_v2 = {**BASE_PARAMS, "need_conf": True, "vol_mult": 2.0,
+            "trend_filter": True, "max_day_tr": 1, "wick_min_pct": 0.35}
+    df_v2 = df_raw.copy()
+    df_v2 = add_indicators(df_v2, p_v2)
+    df_v2["vol_avg"]  = df_v2["volume"].rolling(p_v2["vol_len"]).mean()
+    df_v2["inst_vol"] = df_v2["volume"] >= df_v2["vol_avg"] * p_v2["vol_mult"]
+    df_v2["bull_wick_ok"] = (np.minimum(df_v2.open,df_v2.close)-df_v2.low) >= pct(p_v2["wick_min_pct"],df_v2.low)
+    df_v2["bear_wick_ok"] = (df_v2.high-np.maximum(df_v2.open,df_v2.close)) >= pct(p_v2["wick_min_pct"],df_v2.high)
+    print("\n[2/3] Corriendo v2 (need_conf + vol_mult 2.0 + trend_filter + wick 0.35%)...")
+    t_v2 = run_backtest(df_v2, p_v2)
+    r_v2 = metrics(t_v2, p_v2["initial_cap"])
+    print_result(r_v2, "V2 — need_conf + vol_mult 2.0 + trend_filter + wick 0.35%", p_v2["initial_cap"], t_v2)
+
+    # 4. Grid search: mejor por profit_factor
+    print("\n[3/3] Grid search completo...")
+    grid_df, grid_full = run_grid(df_raw, BASE_PARAMS)
+    grid_df_pos = grid_df[grid_df["return_pct"] > 0].sort_values("profit_factor", ascending=False)
+    print(f"\n  Combinaciones totales    : {len(grid_df)}")
+    print(f"  Combinaciones positivas  : {len(grid_df_pos)}")
+    if not grid_df_pos.empty:
+        best_idx = grid_df_pos.index[0]
+        best_row = grid_df_pos.iloc[0]
+        best_trades = grid_full[best_idx]["trades_df"]
+        best_params = {**BASE_PARAMS}
+        for k in GRID:
+            best_params[k] = best_row[k]
+        # métricas completas del mejor
+        r_best = metrics(best_trades, BASE_PARAMS["initial_cap"])
+        print_result(r_best, "MEJOR COMBINACIÓN (por Profit Factor)", BASE_PARAMS["initial_cap"], best_trades)
+        print("\n  Parámetros ganadores:")
+        for k in GRID:
+            print(f"    {k:<16} = {best_row[k]}")
+        print()
+        best_trades.to_csv("/home/user/TV/backtest_trades_best.csv", index=False)
+
+    t_v2.to_csv("/home/user/TV/backtest_trades_v2.csv", index=False)
+    grid_df.to_csv("/home/user/TV/backtest_grid.csv", index=False)
+    print("\nArchivos guardados: backtest_trades_v2.csv, backtest_trades_best.csv, backtest_grid.csv")
