@@ -1,13 +1,15 @@
 """
 BTC/USDC 1H — Golden Pocket Fibonacci OPTIMIZADA
-Aplicando hallazgos del análisis por régimen:
-  - Solo operar en BULL_FUERTE (EMA21 > EMA55 > EMA200 + pendiente +)
-  - Filtro RSI < 50 en entrada (zona de sobreventa relativa)
-  - Filtro de volumen: vela de entrada con vol > media 20 períodos
-  - SL al breakeven tras TP1
-  - TP2 a 3:1 (subido desde 2.5:1)
-  - Solo 1 trade activo a la vez
-  - Mínimo 12h entre trades (evitar overtrading)
+Régimen: BULL_FUERTE | RSI(14) | MACD(12,26,9) | ADX(14)
+Scale-in: +0.5 contratos en zona 65% si el precio profundiza tras la entrada
+
+Estructura de posición:
+  Entrada 1 (E1): 61.8% GP — 1 unidad (riesgo 1% capital)
+  Scale-in (E2):  65.0%     — 0.5 unidades adicionales
+  SL común:       78.6% del impulso
+  TP1:            1:1 R:R desde precio medio ponderado
+  TP2:            3:1 R:R desde precio medio ponderado
+  BE:             SL → precio E1 tras TP1
 """
 
 import pandas as pd
@@ -49,6 +51,9 @@ MACD_SIGNAL        = 9
 ADX_PERIOD         = 14
 ADX_MIN            = 20          # ADX > 20 → tendencia moderada/fuerte
 VOL_MA_PERIOD      = 20
+SL_LEVEL           = 0.786       # SL estructural en 78.6% del impulso
+SCALE_IN_LEVEL     = 0.650       # scale-in al 65% (profundiza desde 61.8%)
+SCALE_IN_FACTOR    = 0.50        # añadir 0.5 contratos (50% de la pos. inicial)
 MIN_CANDLES_ENTRE  = 12
 SLOPE_WINDOW       = 24          # ventana para pendiente EMA200 (24h)
 SLOPE_MIN          = 0.0005      # pendiente mínima EMA200 (0.05%/24h)
@@ -296,14 +301,20 @@ def identificar_impulsos(df, swing_lows, swing_highs):
 # 5. FIBONACCI
 # ─────────────────────────────────────────
 def fibs(imp):
-    r  = imp["high_price"] - imp["low_price"]
-    h  = imp["high_price"]
-    gp = h - r*GOLDEN_POCKET_LOW
-    sl = gp*(1-SL_NIVEL_PCT)
-    rk = gp-sl
-    return {"gp_lo":gp, "gp_hi":h-r*GOLDEN_POCKET_HI,
-            "sl":sl, "tp1":gp+rk*TP1_RR, "tp2":gp+rk*TP2_RR,
-            "be": gp}  # breakeven = precio de entrada
+    r       = imp["high_price"] - imp["low_price"]
+    h       = imp["high_price"]
+    gp      = h - r * GOLDEN_POCKET_LOW    # 61.8%  — entrada E1
+    scale   = h - r * SCALE_IN_LEVEL       # 65.0%  — scale-in E2
+    sl_base = h - r * SL_LEVEL             # 78.6%  — SL estructural
+    rk      = gp - sl_base                 # riesgo desde E1
+    return {
+        "gp_lo":  gp,
+        "gp_hi":  h - r * GOLDEN_POCKET_HI,
+        "scale":  scale,                    # nivel de scale-in
+        "sl":     sl_base,
+        "tp1":    gp + rk * TP1_RR,
+        "tp2":    gp + rk * TP2_RR,
+    }
 
 # ─────────────────────────────────────────
 # 6. BACKTEST OPTIMIZADO
@@ -399,17 +410,31 @@ def backtest_optimizado(df, impulsos):
         if entrada_exec >= len(df):
             continue
 
-        precio_entrada = cl[entrada_idx]
-        riesgo_usd     = capital*RISK_PCT
-        tam_pos_usd    = min(riesgo_usd/SL_NIVEL_PCT, capital*0.5)
-        btc_size       = tam_pos_usd/precio_entrada
+        # ── E1: entrada principal en 61.8% GP ────────────────────────────
+        precio_e1   = cl[entrada_idx]
+        riesgo_usd  = capital * RISK_PCT
+        tam_pos_usd = min(riesgo_usd / SL_NIVEL_PCT, capital * 0.5)
+        btc_e1      = tam_pos_usd / precio_e1
+
+        # Variables de scale-in (E2 en 65%)
+        scale_hit   = False
+        btc_e2      = 0.0
+        precio_e2   = 0.0
+
+        # Posición total inicial (puede crecer con scale-in)
+        btc_total   = btc_e1
+        avg_entry   = precio_e1
+
+        # TP1/TP2 calculados desde E1 inicialmente (se recalculan tras scale-in)
+        tp1_price   = f["tp1"]
+        tp2_price   = f["tp2"]
 
         resultado     = "TIMEOUT"
         precio_salida = None
         salida_idx    = None
         tp1_hit       = False
-        btc_rem       = btc_size
-        sl_dinamico   = f["sl"]   # SL empieza en 0.8% abajo
+        btc_rem       = btc_total
+        sl_dinamico   = f["sl"]   # SL estructural en 78.6%
 
         trade_activo  = True
 
@@ -417,17 +442,32 @@ def backtest_optimizado(df, impulsos):
             # ── SL dinámico (breakeven tras TP1) ─────────────────────────
             if lo[j] <= sl_dinamico:
                 precio_salida = sl_dinamico
-                resultado = "SL" if sl_dinamico < precio_entrada else "BE"
+                resultado = "SL" if sl_dinamico < avg_entry else "BE"
                 salida_idx = j
                 break
+
+            # ── Scale-in E2: profundiza a 65% ────────────────────────────
+            if not scale_hit and not tp1_hit and lo[j] <= f["scale"]:
+                scale_hit  = True
+                precio_e2  = f["scale"]
+                btc_e2     = btc_e1 * SCALE_IN_FACTOR
+                btc_total  = btc_e1 + btc_e2
+                avg_entry  = (btc_e1 * precio_e1 + btc_e2 * precio_e2) / btc_total
+                # Recalcular TP1/TP2 desde precio medio
+                rk_avg     = avg_entry - f["sl"]
+                tp1_price  = avg_entry + rk_avg * TP1_RR
+                tp2_price  = avg_entry + rk_avg * TP2_RR
+                btc_rem    = btc_total
+
             # ── TP1 ───────────────────────────────────────────────────────
-            if not tp1_hit and hi[j] >= f["tp1"]:
-                tp1_hit    = True
-                btc_rem   *= (1-TP1_FRACTION)
-                sl_dinamico = precio_entrada  # mover SL a breakeven
+            if not tp1_hit and hi[j] >= tp1_price:
+                tp1_hit     = True
+                btc_rem    *= (1 - TP1_FRACTION)
+                sl_dinamico = avg_entry  # mover SL a breakeven
+
             # ── TP2 ───────────────────────────────────────────────────────
-            if hi[j] >= f["tp2"]:
-                precio_salida = f["tp2"]
+            if hi[j] >= tp2_price:
+                precio_salida = tp2_price
                 resultado = "TP2"
                 salida_idx = j
                 break
@@ -436,12 +476,13 @@ def backtest_optimizado(df, impulsos):
             salida_idx    = min(entrada_exec+MAX_HOLD_CANDLES, len(df)-1)
             precio_salida = cl[salida_idx]
 
-        # PnL
+        # ── PnL — dos tramos (E1 siempre, E2 si scale_hit) ───────────────
         if tp1_hit:
-            pnl = (btc_size*TP1_FRACTION*(f["tp1"]-precio_entrada) +
-                   btc_rem*(precio_salida-precio_entrada))
+            # Mitad TP1 al precio TP1, resto al precio_salida (desde avg_entry)
+            pnl = (btc_total * TP1_FRACTION * (tp1_price - avg_entry) +
+                   btc_rem * (precio_salida - avg_entry))
         else:
-            pnl = btc_size*(precio_salida-precio_entrada)
+            pnl = btc_total * (precio_salida - avg_entry)
 
         capital += pnl
         capital  = max(capital, 1)
@@ -455,11 +496,14 @@ def backtest_optimizado(df, impulsos):
             "salida_time":   idx[salida_idx],
             "año":           idx[entrada_exec].year,
             "mes":           idx[entrada_exec].strftime("%Y-%m"),
-            "precio_entrada":round(precio_entrada,2),
+            "precio_entrada":round(avg_entry,2),
+            "precio_e1":     round(precio_e1,2),
+            "precio_e2":     round(precio_e2,2) if scale_hit else None,
+            "scale_hit":     scale_hit,
             "precio_salida": round(precio_salida,2),
             "sl_price":      round(sl_dinamico,2),
-            "tp1_price":     round(f["tp1"],2),
-            "tp2_price":     round(f["tp2"],2),
+            "tp1_price":     round(tp1_price,2),
+            "tp2_price":     round(tp2_price,2),
             "resultado":     resultado,
             "pnl_usd":       round(pnl,2),
             "pnl_pct":       round(pnl/tam_pos_usd*100,2) if tam_pos_usd else 0,
@@ -497,13 +541,16 @@ def calcular_stats(trades_df, equity_curve):
     be_n  = len(trades_df[trades_df["resultado"]=="BE"])
     to_n  = len(trades_df[trades_df["resultado"]=="TIMEOUT"])
     rr = abs(wins["pnl_usd"].mean()/loss["pnl_usd"].mean()) if len(loss) and loss["pnl_usd"].mean() != 0 else 0
+    scale_n = int(trades_df["scale_hit"].sum()) if "scale_hit" in trades_df.columns else 0
     return {
-        "n":        len(trades_df),
-        "wins":     len(wins),
-        "losses":   len(loss),
-        "wr":       round(len(wins)/len(trades_df)*100,1),
-        "tp2_n":    tp2_n, "sl_n":sl_n, "be_n":be_n, "to_n":to_n,
-        "tp1_rate": round(trades_df["tp1_hit"].mean()*100,1),
+        "n":         len(trades_df),
+        "wins":      len(wins),
+        "losses":    len(loss),
+        "wr":        round(len(wins)/len(trades_df)*100,1),
+        "tp2_n":     tp2_n, "sl_n":sl_n, "be_n":be_n, "to_n":to_n,
+        "tp1_rate":  round(trades_df["tp1_hit"].mean()*100,1),
+        "scale_n":   scale_n,
+        "scale_pct": round(scale_n/len(trades_df)*100,1),
         "cap_final":round(eq[-1],2),
         "retorno":  round((eq[-1]/CAPITAL_INICIAL-1)*100,1),
         "max_dd":   round(dd.min(),1),
@@ -776,6 +823,7 @@ def graficar(df, trades_df, s, equity_curve, equity_times):
             ("Profit Factor",    str(s['pf'])),
             ("TP1 Hit Rate",     f"{s['tp1_rate']}%"),
             ("TP2 completados",  str(s['tp2_n'])),
+            ("Scale-in hits",    f"{s['scale_n']} ({s['scale_pct']}%)"),
         ]),
         ("EXITS", [
             ("SL activados",     str(s['sl_n'])),
@@ -869,6 +917,7 @@ def reporte_consola(s, trades_df):
         ("SL activados",          f"{s['sl_n']}",           ""),
         ("Breakeven (no loss)",   f"{s['be_n']}",           "— nuevo"),
         ("TP1 Hit Rate",          f"{s['tp1_rate']}%",      ""),
+        ("Scale-in hits",         f"{s['scale_n']} ({s['scale_pct']}%)", "— nuevo"),
         ("Avg R:R efectivo",      f"{s['rr']}:1",           "1.07 → mejor?"),
         ("RSI medio en entrada",  f"{s['avg_rsi']}",        ""),
         ("ADX medio en entrada",  f"{s['avg_adx']}",        ""),
