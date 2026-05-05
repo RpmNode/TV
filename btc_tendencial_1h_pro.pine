@@ -1,0 +1,64 @@
+//@version=5
+strategy("BTC Tendencial 1H PRO", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=1)
+
+// === MEDIAS ===
+sma20  = ta.sma(close, 20)
+sma50  = ta.sma(close, 50)
+sma100 = ta.sma(close, 100)
+sma200 = ta.sma(close, 200)
+
+// === RSI ===
+rsi = ta.rsi(close, 14)
+
+// === MACD ===
+[macdLine, signalLine, hist] = ta.macd(close, 12, 26, 9)
+
+// === ATR ===
+atr     = ta.atr(14)
+atrMean = ta.sma(atr, 50)
+
+// === FILTRO MACRO (SPY > SMA200) ===
+// Solo opera LONG si el S&P500 está en tendencia alcista estructural
+spyClose  = request.security("SPY", timeframe.period, close)
+spy200    = ta.sma(spyClose, 200)
+macroFilter = spyClose > spy200
+
+// === TENDENCIA ===
+trendLong = sma20 > sma50 and sma50 > sma100 and sma100 > sma200 and close > sma50
+
+// === MOMENTUM ===
+momentumLong = rsi > 55 and macdLine > signalLine and hist > hist[1]
+
+// === VOLATILIDAD ===
+volatilityOK = atr > atrMean
+
+// === PULLBACK (corregido: solo vs SMA20, ya que trendLong exige close > sma50) ===
+// Verifica que precio tocó SMA20 en la vela actual o la anterior
+pullback = low <= sma20 or low[1] <= sma20[1]
+
+// === FILTRO MECHA (corregido: guard division por cero) ===
+candleRange = high - low
+upperWick   = high - math.max(open, close)
+lowerWick   = math.min(open, close) - low
+wickFilter  = candleRange > 0 and (upperWick / candleRange < 0.6) and (lowerWick / candleRange < 0.6)
+
+// === ENTRADA ===
+longCondition = macroFilter and trendLong and momentumLong and volatilityOK and pullback and wickFilter and close > high[1]
+
+// === STOP Y TP fijados en el momento de entrada (corregido: ya no se recalculan cada barra) ===
+var float entryStop = na
+var float entryTP   = na
+
+if longCondition
+    entryStop := close - atr * 1.2
+    entryTP   := close + atr * 1.8
+    strategy.entry("LONG", strategy.long)
+
+strategy.exit("TP/SL", from_entry="LONG", stop=entryStop, limit=entryTP)
+
+// === PLOTS ===
+plot(sma20,  color=color.blue,   title="SMA 20")
+plot(sma50,  color=color.green,  title="SMA 50")
+plot(sma100, color=color.orange, title="SMA 100")
+plot(sma200, color=color.red,    title="SMA 200")
+plot(spy200, color=color.purple, title="SPY SMA200", linewidth=1, style=plot.style_circles)
