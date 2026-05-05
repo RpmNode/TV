@@ -40,9 +40,16 @@ EMA_FAST           = 21
 EMA_MED            = 55
 EMA_SLOW           = 200
 RSI_PERIOD         = 14
-RSI_MAX_ENTRY      = 52          # RSI < 52 en entrada (no sobrecomprado)
-VOL_MA_PERIOD      = 20          # volumen > media 20p para confirmar
-MIN_CANDLES_ENTRE  = 12          # mínimo 12h entre entradas
+RSI_MIN_ENTRY      = 28          # RSI > 28 (margen para impulsos fuertes)
+RSI_MAX_ENTRY      = 55          # RSI < 55
+RSI_SLOPE_MIN      = -1.0        # RSI no debe estar cayendo fuerte
+MACD_FAST          = 12
+MACD_SLOW          = 26
+MACD_SIGNAL        = 9
+ADX_PERIOD         = 14
+ADX_MIN            = 20          # ADX > 20 → tendencia moderada/fuerte
+VOL_MA_PERIOD      = 20
+MIN_CANDLES_ENTRE  = 12
 SLOPE_WINDOW       = 24          # ventana para pendiente EMA200 (24h)
 SLOPE_MIN          = 0.0005      # pendiente mínima EMA200 (0.05%/24h)
 
@@ -177,19 +184,50 @@ def calcular_indicadores(df):
     # Pendiente EMA200 (%/24h)
     df["slope200"] = df["ema200"].diff(SLOPE_WINDOW) / df["ema200"].shift(SLOPE_WINDOW)
 
-    # RSI 14
-    delta = cl.diff()
-    gain  = delta.clip(lower=0).ewm(span=RSI_PERIOD, adjust=False).mean()
-    loss  = (-delta.clip(upper=0)).ewm(span=RSI_PERIOD, adjust=False).mean()
-    rs    = gain / loss.replace(0, np.nan)
-    df["rsi"] = 100 - (100/(1+rs))
+    # ── RSI 14 ────────────────────────────────────────────────────────────
+    delta      = cl.diff()
+    gain       = delta.clip(lower=0).ewm(span=RSI_PERIOD, adjust=False).mean()
+    loss_      = (-delta.clip(upper=0)).ewm(span=RSI_PERIOD, adjust=False).mean()
+    rs         = gain / loss_.replace(0, np.nan)
+    df["rsi"]  = 100 - (100 / (1 + rs))
+    df["rsi_slope"] = df["rsi"].diff(3)   # pendiente RSI en 3 velas
+
+    # ── MACD (12, 26, 9) ──────────────────────────────────────────────────
+    ema_fast        = cl.ewm(span=MACD_FAST,   adjust=False).mean()
+    ema_slow        = cl.ewm(span=MACD_SLOW,   adjust=False).mean()
+    df["macd_line"] = ema_fast - ema_slow
+    df["macd_sig"]  = df["macd_line"].ewm(span=MACD_SIGNAL, adjust=False).mean()
+    df["macd_hist"] = df["macd_line"] - df["macd_sig"]
+    # Cruce alcista: histograma acaba de cruzar de negativo a positivo
+    df["macd_cross_up"] = (df["macd_hist"] > 0) & (df["macd_hist"].shift(1) <= 0)
+    # Histograma aumentando (momentum positivo)
+    df["macd_rising"]   = (df["macd_hist"] > df["macd_hist"].shift(1)) & \
+                          (df["macd_hist"].shift(1) > df["macd_hist"].shift(2))
+
+    # ── ADX 14 ────────────────────────────────────────────────────────────
+    tr = pd.concat([hi - lo,
+                    (hi - cl.shift()).abs(),
+                    (lo - cl.shift()).abs()], axis=1).max(axis=1)
+    df["atr"] = tr.ewm(span=ADX_PERIOD, adjust=False).mean()
+
+    # +DM / -DM
+    up_move   = hi.diff()
+    down_move = -lo.diff()
+    plus_dm   = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm  = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    plus_dm_s  = pd.Series(plus_dm,  index=df.index).ewm(span=ADX_PERIOD, adjust=False).mean()
+    minus_dm_s = pd.Series(minus_dm, index=df.index).ewm(span=ADX_PERIOD, adjust=False).mean()
+
+    plus_di  = 100 * plus_dm_s  / df["atr"].replace(0, np.nan)
+    minus_di = 100 * minus_dm_s / df["atr"].replace(0, np.nan)
+    dx       = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    df["adx"]      = dx.ewm(span=ADX_PERIOD, adjust=False).mean()
+    df["plus_di"]  = plus_di
+    df["minus_di"] = minus_di
 
     # Volumen medio 20 períodos
     df["vol_ma20"] = vo.rolling(VOL_MA_PERIOD).mean()
-
-    # ATR 14
-    tr = pd.concat([hi-lo, (hi-cl.shift()).abs(), (lo-cl.shift()).abs()], axis=1).max(axis=1)
-    df["atr"] = tr.ewm(span=14, adjust=False).mean()
 
     # Régimen
     regime = []
@@ -276,14 +314,21 @@ def backtest_optimizado(df, impulsos):
     equity_times = [df.index[0]]
     trades       = []
 
-    lo  = df["low"].values
-    hi  = df["high"].values
-    cl  = df["close"].values
-    vo  = df["volume"].values
-    idx = df.index
-    reg = df["regime"].values
-    rsi = df["rsi"].values
-    vm20= df["vol_ma20"].values
+    lo   = df["low"].values
+    hi   = df["high"].values
+    cl   = df["close"].values
+    vo   = df["volume"].values
+    idx  = df.index
+    reg  = df["regime"].values
+    rsi  = df["rsi"].values
+    rsi_slope = df["rsi_slope"].values
+    mhist= df["macd_hist"].values
+    mcross= df["macd_cross_up"].values
+    mrising= df["macd_rising"].values
+    adx_ = df["adx"].values
+    pdi  = df["plus_di"].values
+    mdi  = df["minus_di"].values
+    vm20 = df["vol_ma20"].values
 
     ultimo_salida = -MIN_CANDLES_ENTRE
     trade_activo  = False
@@ -305,19 +350,45 @@ def backtest_optimizado(df, impulsos):
 
         entrada_idx = None
         for i in range(inicio, fin):
-            # ── FILTRO 2: Régimen sigue siendo BULL_FUERTE en la entrada ──
+            # ── F2: Régimen BULL_FUERTE en la entrada ─────────────────────
             if reg[i] != "BULL_FUERTE":
                 continue
-            # ── FILTRO 3: RSI < RSI_MAX_ENTRY (no sobrecomprado) ──────────
-            if not np.isnan(rsi[i]) and rsi[i] > RSI_MAX_ENTRY:
+
+            # ── F3: RSI en zona de retroceso 28-55 ───────────────────────
+            r = rsi[i]
+            if np.isnan(r):
                 continue
-            # ── FILTRO 4: Volumen > media 20 (confirmación) ───────────────
+            if not (RSI_MIN_ENTRY <= r <= RSI_MAX_ENTRY):
+                continue
+            # RSI no debe estar en caída libre (pendiente no muy negativa)
+            if not np.isnan(rsi_slope[i]) and rsi_slope[i] < -3:
+                continue
+
+            # ── F4: MACD histograma girando al alza ───────────────────────
+            # En el Golden Pocket el histograma viene de negativo → debe girar
+            # Condición: hist mejora respecto a 2 velas atrás (reversión local)
+            prev2 = max(0, i-2)
+            if np.isnan(mhist[i]) or np.isnan(mhist[prev2]):
+                continue
+            if mhist[i] <= mhist[prev2]:        # no está mejorando → skip
+                continue
+
+            # ── F5: ADX — filtro de calidad suave ────────────────────────
+            # Eliminar solo mercados claramente en rango (ADX < 15)
+            # o cuando -DI domina ampliamente a +DI (bajista fuerte)
+            if not np.isnan(adx_[i]) and adx_[i] > 5:   # ADX calculado
+                if adx_[i] < 15:                # rango puro → skip
+                    continue
+                if pdi[i] < mdi[i] * 0.75:     # -DI domina claramente → skip
+                    continue
+
+            # ── F6: Volumen > 80% de media 20 ────────────────────────────
             if not np.isnan(vm20[i]) and vo[i] < vm20[i] * 0.8:
                 continue
-            # ── CONDICIÓN GOLDEN POCKET: toca 61.8% y cierra arriba ───────
+
+            # ── GOLDEN POCKET: toca 61.8%, vela de reversión alcista ──────
             if lo[i] <= f["gp_lo"] and cl[i] > f["gp_hi"]:
-                # Vela de reversión: cierre en mitad superior
-                if cl[i] > (lo[i]+hi[i])/2:
+                if cl[i] > (lo[i] + hi[i]) / 2:
                     entrada_idx = i
                     break
 
@@ -396,7 +467,10 @@ def backtest_optimizado(df, impulsos):
             "duracion_h":    round(dur_h,1),
             "rango_imp":     round(imp["rango_pct"]*100,2),
             "tp1_hit":       tp1_hit,
-            "rsi_entrada":   round(rsi[entrada_idx],1) if not np.isnan(rsi[entrada_idx]) else 0,
+            "rsi_entrada":   round(rsi[entrada_idx],   1) if not np.isnan(rsi[entrada_idx])   else 0,
+            "macd_hist":     round(mhist[entrada_idx], 4) if not np.isnan(mhist[entrada_idx]) else 0,
+            "adx_entrada":   round(adx_[entrada_idx],  1) if not np.isnan(adx_[entrada_idx])  else 0,
+            "plus_di":       round(pdi[entrada_idx],   1) if not np.isnan(pdi[entrada_idx])   else 0,
         })
         equity_curve.append(capital)
         equity_times.append(idx[salida_idx])
@@ -442,7 +516,9 @@ def calcular_stats(trades_df, equity_curve):
         "worst":    round(trades_df["pnl_usd"].min(),2),
         "avg_dur":  round(trades_df["duracion_h"].mean(),1),
         "eq_arr":   eq, "dd_arr":dd,
-        "avg_rsi":  round(trades_df["rsi_entrada"].mean(),1),
+        "avg_rsi":  round(trades_df["rsi_entrada"].mean(), 1),
+        "avg_adx":  round(trades_df["adx_entrada"].mean(), 1),
+        "avg_macd": round(trades_df["macd_hist"].mean(),   4),
     }
 
 # ─────────────────────────────────────────
@@ -452,11 +528,11 @@ def graficar(df, trades_df, s, equity_curve, equity_times):
     fig = plt.figure(figsize=(20, 20))
     fig.patch.set_facecolor("#0d1117")
     fig.suptitle(
-        "BTC/USDC 1H — Golden Pocket Fibonacci OPTIMIZADA\n"
-        "Solo BULL_FUERTE · RSI<52 · Vol confirmado · SL→BE tras TP1 · TP2=3:1 R:R",
-        fontsize=13, fontweight="bold", color="#f0f6fc", y=0.99
+        "BTC/USDC 1H — Golden Pocket Fibonacci · RSI + MACD + ADX\n"
+        "BULL_FUERTE · RSI 30-52 girando ↑ · MACD hist cruce/aceleración · ADX>25 +DI>-DI · SL→BE · TP2=3:1",
+        fontsize=12, fontweight="bold", color="#f0f6fc", y=0.99
     )
-    gs = gridspec.GridSpec(4,3, figure=fig, hspace=0.48, wspace=0.32)
+    gs = gridspec.GridSpec(5, 3, figure=fig, hspace=0.50, wspace=0.32)
 
     def style(ax, title="", fs=9):
         ax.set_facecolor("#161b22")
@@ -587,8 +663,101 @@ def graficar(df, trades_df, s, equity_curve, equity_times):
         ax_yr.tick_params(axis="x", labelrotation=30)
         ax_yr.set_ylabel("USD", color="#8b949e", fontsize=7)
 
-    # ── Panel G: Tabla de estadísticas ───────────────────────────────────
-    ax_tab = fig.add_subplot(gs[3,:])
+    # ── Panel G: RSI en trades ────────────────────────────────────────────
+    ax_rsi = fig.add_subplot(gs[3, 0])
+    style(ax_rsi, "RSI en entrada (distribución)")
+    if not trades_df.empty:
+        rsi_w = trades_df[trades_df["pnl_usd"]>0]["rsi_entrada"]
+        rsi_l = trades_df[trades_df["pnl_usd"]<=0]["rsi_entrada"]
+        ax_rsi.hist(rsi_w, bins=12, color="#3fb950", alpha=0.7, label="Wins")
+        ax_rsi.hist(rsi_l, bins=12, color="#f85149", alpha=0.7, label="Losses")
+        ax_rsi.axvline(30, color="#ff9800", lw=0.9, linestyle="--", alpha=0.8)
+        ax_rsi.axvline(50, color="#8b949e", lw=0.9, linestyle="--", alpha=0.8)
+        ax_rsi.text(31, ax_rsi.get_ylim()[1]*0.85, "30", color="#ff9800", fontsize=7)
+        ax_rsi.text(51, ax_rsi.get_ylim()[1]*0.85, "50", color="#8b949e", fontsize=7)
+        ax_rsi.legend(facecolor="#21262d", labelcolor="#f0f6fc", fontsize=7)
+        ax_rsi.set_xlabel("RSI", color="#8b949e", fontsize=7)
+        ax_rsi.set_ylabel("# trades", color="#8b949e", fontsize=7)
+
+    # ── Panel H: MACD histograma en trades ────────────────────────────────
+    ax_macd = fig.add_subplot(gs[3, 1])
+    style(ax_macd, "MACD histograma en entrada")
+    if not trades_df.empty:
+        mh_w = trades_df[trades_df["pnl_usd"]>0]["macd_hist"]
+        mh_l = trades_df[trades_df["pnl_usd"]<=0]["macd_hist"]
+        ax_macd.hist(mh_w, bins=12, color="#3fb950", alpha=0.7, label="Wins")
+        ax_macd.hist(mh_l, bins=12, color="#f85149", alpha=0.7, label="Losses")
+        ax_macd.axvline(0, color="#f0f6fc", lw=0.8)
+        ax_macd.legend(facecolor="#21262d", labelcolor="#f0f6fc", fontsize=7)
+        ax_macd.set_xlabel("MACD Hist", color="#8b949e", fontsize=7)
+        ax_macd.set_ylabel("# trades", color="#8b949e", fontsize=7)
+
+    # ── Panel I: ADX en trades ────────────────────────────────────────────
+    ax_adx = fig.add_subplot(gs[3, 2])
+    style(ax_adx, "ADX en entrada (fuerza de tendencia)")
+    if not trades_df.empty:
+        adx_w = trades_df[trades_df["pnl_usd"]>0]["adx_entrada"]
+        adx_l = trades_df[trades_df["pnl_usd"]<=0]["adx_entrada"]
+        ax_adx.hist(adx_w, bins=12, color="#3fb950", alpha=0.7, label="Wins")
+        ax_adx.hist(adx_l, bins=12, color="#f85149", alpha=0.7, label="Losses")
+        ax_adx.axvline(ADX_MIN, color="#d29922", lw=0.9, linestyle="--")
+        ax_adx.axvline(40, color="#8b949e", lw=0.9, linestyle="--", alpha=0.6)
+        ax_adx.text(ADX_MIN+0.5, ax_adx.get_ylim()[1]*0.85, str(ADX_MIN),
+                    color="#d29922", fontsize=7)
+        ax_adx.legend(facecolor="#21262d", labelcolor="#f0f6fc", fontsize=7)
+        ax_adx.set_xlabel("ADX", color="#8b949e", fontsize=7)
+        ax_adx.set_ylabel("# trades", color="#8b949e", fontsize=7)
+
+    # ── Panel J: WR por rango de ADX ─────────────────────────────────────
+    ax_adx2 = fig.add_subplot(gs[4, 0])
+    style(ax_adx2, "Win Rate por rango ADX")
+    if not trades_df.empty:
+        bins_adx = [25, 30, 35, 40, 50, 70]
+        labels_adx = ["25-30","30-35","35-40","40-50","50+"]
+        trades_df["adx_bucket"] = pd.cut(trades_df["adx_entrada"],
+                                          bins=bins_adx, labels=labels_adx, right=False)
+        wr_adx = trades_df.groupby("adx_bucket", observed=True)["pnl_usd"].apply(
+            lambda x: (x>0).mean()*100).reset_index(name="wr")
+        cnt_adx = trades_df.groupby("adx_bucket", observed=True).size().reset_index(name="n")
+        merged_adx = wr_adx.merge(cnt_adx, on="adx_bucket")
+        bar_c = ["#3fb950" if w>=50 else "#f85149" for w in merged_adx["wr"]]
+        bars = ax_adx2.bar(merged_adx["adx_bucket"].astype(str), merged_adx["wr"],
+                           color=bar_c, alpha=0.85)
+        ax_adx2.axhline(50, color="#8b949e", lw=0.8, linestyle="--")
+        for bar, (_, row) in zip(bars, merged_adx.iterrows()):
+            ax_adx2.text(bar.get_x()+bar.get_width()/2,
+                         bar.get_height()+1, f"{row['wr']:.0f}%\n({row['n']})",
+                         ha="center", color="#f0f6fc", fontsize=6.5)
+        ax_adx2.set_ylabel("Win Rate %", color="#8b949e", fontsize=7)
+        ax_adx2.set_xlabel("ADX range", color="#8b949e", fontsize=7)
+        ax_adx2.set_ylim(0, 90)
+
+    # ── Panel K: WR por rango RSI ─────────────────────────────────────────
+    ax_rsi2 = fig.add_subplot(gs[4, 1])
+    style(ax_rsi2, "Win Rate por rango RSI")
+    if not trades_df.empty:
+        bins_rsi = [30, 35, 40, 45, 50, 53]
+        labels_rsi = ["30-35","35-40","40-45","45-50","50-52"]
+        trades_df["rsi_bucket"] = pd.cut(trades_df["rsi_entrada"],
+                                          bins=bins_rsi, labels=labels_rsi, right=False)
+        wr_rsi = trades_df.groupby("rsi_bucket", observed=True)["pnl_usd"].apply(
+            lambda x: (x>0).mean()*100).reset_index(name="wr")
+        cnt_rsi = trades_df.groupby("rsi_bucket", observed=True).size().reset_index(name="n")
+        merged_rsi = wr_rsi.merge(cnt_rsi, on="rsi_bucket")
+        bar_c = ["#3fb950" if w>=50 else "#f85149" for w in merged_rsi["wr"]]
+        bars = ax_rsi2.bar(merged_rsi["rsi_bucket"].astype(str), merged_rsi["wr"],
+                           color=bar_c, alpha=0.85)
+        ax_rsi2.axhline(50, color="#8b949e", lw=0.8, linestyle="--")
+        for bar, (_, row) in zip(bars, merged_rsi.iterrows()):
+            ax_rsi2.text(bar.get_x()+bar.get_width()/2,
+                         bar.get_height()+1, f"{row['wr']:.0f}%\n({row['n']})",
+                         ha="center", color="#f0f6fc", fontsize=6.5)
+        ax_rsi2.set_ylabel("Win Rate %", color="#8b949e", fontsize=7)
+        ax_rsi2.set_xlabel("RSI range", color="#8b949e", fontsize=7)
+        ax_rsi2.set_ylim(0, 90)
+
+    # ── Panel L: Tabla de estadísticas ────────────────────────────────────
+    ax_tab = fig.add_subplot(gs[4, 2])
     ax_tab.axis("off")
     style(ax_tab, "")
 
@@ -621,6 +790,8 @@ def graficar(df, trades_df, s, equity_curve, equity_times):
             ("Mejor trade",      f"${s['best']:,.2f}"),
             ("Peor trade",       f"${s['worst']:,.2f}"),
             ("Duración media",   f"{s['avg_dur']}h"),
+            ("Avg RSI entrada",  str(s['avg_rsi'])),
+            ("Avg ADX entrada",  str(s['avg_adx'])),
         ]),
     ]
 
@@ -681,7 +852,7 @@ def reporte_consola(s, trades_df):
     sep = "═"*60
     print(f"\n{sep}")
     print("  BTC/USDC 1H — GOLDEN POCKET FIBONACCI OPTIMIZADA")
-    print("  Filtros: BULL_FUERTE · RSI<52 · Vol>MA20 · BE tras TP1")
+    print("  Filtros: BULL_FUERTE · RSI 30-52↑ · MACD hist cruce/aceleración · ADX>25 +DI>-DI")
     print(f"  Capital: ${CAPITAL_INICIAL:,}  ·  Riesgo: {RISK_PCT*100:.0f}%/trade  ·  5 años")
     print(sep)
     print(f"\n  {'MÉTRICA':<28} {'VALOR':>12}   {'vs. SIN FILTROS':>15}")
@@ -700,6 +871,8 @@ def reporte_consola(s, trades_df):
         ("TP1 Hit Rate",          f"{s['tp1_rate']}%",      ""),
         ("Avg R:R efectivo",      f"{s['rr']}:1",           "1.07 → mejor?"),
         ("RSI medio en entrada",  f"{s['avg_rsi']}",        ""),
+        ("ADX medio en entrada",  f"{s['avg_adx']}",        ""),
+        ("MACD hist medio",       f"{s['avg_macd']:.4f}",   ""),
         ("Duración media",        f"{s['avg_dur']}h",       ""),
     ]
     for k, v, comp in rows:
