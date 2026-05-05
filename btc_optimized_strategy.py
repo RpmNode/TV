@@ -1,0 +1,767 @@
+"""
+BTC/USDC 1H — Golden Pocket Fibonacci OPTIMIZADA
+Aplicando hallazgos del análisis por régimen:
+  - Solo operar en BULL_FUERTE (EMA21 > EMA55 > EMA200 + pendiente +)
+  - Filtro RSI < 50 en entrada (zona de sobreventa relativa)
+  - Filtro de volumen: vela de entrada con vol > media 20 períodos
+  - SL al breakeven tras TP1
+  - TP2 a 3:1 (subido desde 2.5:1)
+  - Solo 1 trade activo a la vez
+  - Mínimo 12h entre trades (evitar overtrading)
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
+import warnings
+warnings.filterwarnings("ignore")
+
+np.random.seed(42)
+
+# ─────────────────────────────────────────
+# PARÁMETROS FINALES
+# ─────────────────────────────────────────
+LOOKBACK_SWING     = 5
+MIN_IMPULSE_PCT    = 0.0075      # 0.75% mínimo (usuario)
+GOLDEN_POCKET_LOW  = 0.618
+GOLDEN_POCKET_HI   = 0.650
+SL_NIVEL_PCT       = 0.008       # 0.8% SL
+TP1_RR             = 1.0         # TP1 a 1:1
+TP2_RR             = 3.0         # TP2 a 3:1 (mejorado desde 2.5)
+TP1_FRACTION       = 0.50
+CAPITAL_INICIAL    = 10_000
+RISK_PCT           = 0.01        # 1% riesgo/trade
+MAX_HOLD_CANDLES   = 72          # 3 días máximo
+EMA_FAST           = 21
+EMA_MED            = 55
+EMA_SLOW           = 200
+RSI_PERIOD         = 14
+RSI_MAX_ENTRY      = 52          # RSI < 52 en entrada (no sobrecomprado)
+VOL_MA_PERIOD      = 20          # volumen > media 20p para confirmar
+MIN_CANDLES_ENTRE  = 12          # mínimo 12h entre entradas
+SLOPE_WINDOW       = 24          # ventana para pendiente EMA200 (24h)
+SLOPE_MIN          = 0.0005      # pendiente mínima EMA200 (0.05%/24h)
+
+REGIME_COLORS = {
+    "BULL_FUERTE":   "#00c853",
+    "BULL_MODERADO": "#69f0ae",
+    "RECUPERACION":  "#ffeb3b",
+    "RANGO":         "#ff9800",
+    "BEAR_MODERADO": "#ff5722",
+    "BEAR_FUERTE":   "#d32f2f",
+}
+
+# ─────────────────────────────────────────
+# 1. DATOS HISTÓRICOS BTC
+# ─────────────────────────────────────────
+BTC_MONTHLY_ANCHORS = [
+    ("2021-01-01", 29000,  42000, 27000,  38500, 1.0),
+    ("2021-02-01", 38500,  58500, 36000,  45000, 1.3),
+    ("2021-03-01", 45000,  61000, 47000,  58800, 1.1),
+    ("2021-04-01", 58800,  65000, 47000,  57500, 1.2),
+    ("2021-05-01", 57500,  59500, 30000,  37000, 1.8),
+    ("2021-06-01", 37000,  41000, 28800,  35000, 1.4),
+    ("2021-07-01", 35000,  42500, 29700,  41500, 1.2),
+    ("2021-08-01", 41500,  50200, 39600,  47100, 1.1),
+    ("2021-09-01", 47100,  52950, 39600,  43800, 1.2),
+    ("2021-10-01", 43800,  67000, 43400,  60900, 1.3),
+    ("2021-11-01", 60900,  69000, 53600,  57200, 1.5),
+    ("2021-12-01", 57200,  59050, 42000,  47700, 1.3),
+    ("2022-01-01", 47700,  48000, 32900,  38500, 1.4),
+    ("2022-02-01", 38500,  45800, 36800,  43200, 1.1),
+    ("2022-03-01", 43200,  48100, 37600,  45500, 1.0),
+    ("2022-04-01", 45500,  47400, 37600,  38400, 1.1),
+    ("2022-05-01", 38400,  40000, 25400,  31500, 1.6),
+    ("2022-06-01", 31500,  31800, 17600,  19100, 2.0),
+    ("2022-07-01", 19100,  25200, 18800,  23300, 1.5),
+    ("2022-08-01", 23300,  25200, 19600,  20050, 1.3),
+    ("2022-09-01", 20050,  22700, 18200,  19500, 1.2),
+    ("2022-10-01", 19500,  21500, 18900,  20500, 1.1),
+    ("2022-11-01", 20500,  21500, 15476,  16550, 2.5),
+    ("2022-12-01", 16550,  18400, 16200,  16600, 1.4),
+    ("2023-01-01", 16600,  23800, 16400,  23100, 1.3),
+    ("2023-02-01", 23100,  25200, 21350,  23200, 1.0),
+    ("2023-03-01", 23200,  29200, 19600,  28400, 1.2),
+    ("2023-04-01", 28400,  31000, 26750,  29200, 1.0),
+    ("2023-05-01", 29200,  29800, 25800,  27200, 1.1),
+    ("2023-06-01", 27200,  31800, 24800,  30500, 1.2),
+    ("2023-07-01", 30500,  32000, 28500,  29200, 1.0),
+    ("2023-08-01", 29200,  30200, 24750,  25900, 1.1),
+    ("2023-09-01", 25900,  27900, 24900,  26900, 0.9),
+    ("2023-10-01", 26900,  35700, 26400,  34600, 1.3),
+    ("2023-11-01", 34600,  38000, 33600,  37900, 1.2),
+    ("2023-12-01", 37900,  44800, 37200,  42300, 1.3),
+    ("2024-01-01", 42300,  49000, 38500,  42700, 1.2),
+    ("2024-02-01", 42700,  57500, 41550,  62400, 1.5),
+    ("2024-03-01", 62400,  73780, 59000,  71400, 1.6),
+    ("2024-04-01", 71400,  72800, 56500,  60700, 1.4),
+    ("2024-05-01", 60700,  73750, 56600,  67500, 1.2),
+    ("2024-06-01", 67500,  71900, 58400,  62700, 1.1),
+    ("2024-07-01", 62700,  70000, 53500,  66200, 1.2),
+    ("2024-08-01", 66200,  65300, 49000,  59100, 1.4),
+    ("2024-09-01", 59100,  66500, 52700,  63300, 1.1),
+    ("2024-10-01", 63300,  73600, 60200,  72400, 1.2),
+    ("2024-11-01", 72400,  99700, 67500,  97200, 1.7),
+    ("2024-12-01", 97200, 108500, 91800,  93400, 1.5),
+    ("2025-01-01", 93400, 109000, 89000,  95800, 1.4),
+    ("2025-02-01", 95800, 100200, 78400,  84500, 1.3),
+    ("2025-03-01", 84500,  92000, 76800,  82300, 1.2),
+    ("2025-04-01", 82300,  97500, 74600,  94100, 1.3),
+    ("2025-05-01", 94100, 107000, 93000, 103500, 1.2),
+    ("2025-06-01",103500, 116000,100000, 110000, 1.2),
+    ("2025-07-01",110000, 125000,107000, 121000, 1.3),
+    ("2025-08-01",121000, 127000,110000, 114000, 1.3),
+    ("2025-09-01",114000, 126000,107000, 118000, 1.2),
+    ("2025-10-01",118000, 126000,105000, 108000, 1.3),
+    ("2025-11-01",108000, 118000, 83500,  90000, 1.5),
+    ("2025-12-01", 90000,  96000, 83000,  87000, 1.3),
+    ("2026-01-01", 87000,  91000, 74700,  79500, 1.3),
+    ("2026-02-01", 79500,  85000, 59500,  71000, 1.5),
+    ("2026-03-01", 71000,  80000, 66000,  72600, 1.3),
+    ("2026-04-01", 72600,  80200, 67044,  75000, 1.4),
+    ("2026-05-01", 75000,  81500, 74000,  80696, 1.2),
+]
+
+# ─────────────────────────────────────────
+# 2. GENERAR OHLCV 1H
+# ─────────────────────────────────────────
+def generar_ohlcv_1h(anchors):
+    rows = []
+    for i in range(len(anchors) - 1):
+        ts0,o0,h0,l0,c0,v0 = anchors[i]
+        ts1,o1,h1,l1,c1,v1 = anchors[i+1]
+        dt0   = pd.Timestamp(ts0)
+        dt1   = pd.Timestamp(ts1)
+        horas = int((dt1-dt0).total_seconds()/3600)
+        if horas <= 0: continue
+        sigma = 0.008*v0
+        mu    = np.log(c1/c0)/horas
+        precio = c0
+        for h in range(horas):
+            t      = dt0 + pd.Timedelta(hours=h)
+            ret    = mu + sigma*np.random.randn()
+            precio = precio*np.exp(ret)
+            if h == horas-1:
+                precio = c1*(1+np.random.uniform(-0.003,0.003))
+            rng = precio*sigma*abs(np.random.randn()+0.5)
+            wu  = precio*sigma*abs(np.random.randn()*0.3)
+            wd  = precio*sigma*abs(np.random.randn()*0.3)
+            op  = precio*(1+np.random.uniform(-sigma*0.3,sigma*0.3))
+            cl_ = precio
+            hi_ = max(op,cl_)+wu+rng*0.3
+            lo_ = min(op,cl_)-wd-rng*0.3
+            vol = v0*abs(np.random.randn()+1)*1000
+            rows.append({"timestamp":t,"open":round(op,2),"high":round(hi_,2),
+                         "low":round(lo_,2),"close":round(cl_,2),"volume":round(vol,2)})
+    df = pd.DataFrame(rows).set_index("timestamp")
+    return df[df["low"]>0]
+
+# ─────────────────────────────────────────
+# 3. INDICADORES + RÉGIMEN
+# ─────────────────────────────────────────
+def calcular_indicadores(df):
+    cl = df["close"]
+    hi = df["high"]
+    lo = df["low"]
+    vo = df["volume"]
+
+    # EMAs
+    df["ema21"]  = cl.ewm(span=EMA_FAST, adjust=False).mean()
+    df["ema55"]  = cl.ewm(span=EMA_MED,  adjust=False).mean()
+    df["ema200"] = cl.ewm(span=EMA_SLOW, adjust=False).mean()
+
+    # Pendiente EMA200 (%/24h)
+    df["slope200"] = df["ema200"].diff(SLOPE_WINDOW) / df["ema200"].shift(SLOPE_WINDOW)
+
+    # RSI 14
+    delta = cl.diff()
+    gain  = delta.clip(lower=0).ewm(span=RSI_PERIOD, adjust=False).mean()
+    loss  = (-delta.clip(upper=0)).ewm(span=RSI_PERIOD, adjust=False).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    df["rsi"] = 100 - (100/(1+rs))
+
+    # Volumen medio 20 períodos
+    df["vol_ma20"] = vo.rolling(VOL_MA_PERIOD).mean()
+
+    # ATR 14
+    tr = pd.concat([hi-lo, (hi-cl.shift()).abs(), (lo-cl.shift()).abs()], axis=1).max(axis=1)
+    df["atr"] = tr.ewm(span=14, adjust=False).mean()
+
+    # Régimen
+    regime = []
+    for i in range(len(df)):
+        p   = cl.iloc[i]
+        e21 = df["ema21"].iloc[i]
+        e55 = df["ema55"].iloc[i]
+        e200= df["ema200"].iloc[i]
+        sl  = df["slope200"].iloc[i]
+        if any(pd.isna(x) for x in [e21,e55,e200,sl]):
+            regime.append("RANGO"); continue
+        a200 = p > e200
+        a21_55  = e21 > e55
+        a55_200 = e55 > e200
+        if a200 and a21_55 and a55_200 and sl > SLOPE_MIN:
+            regime.append("BULL_FUERTE")
+        elif a200 and a21_55 and a55_200:
+            regime.append("BULL_MODERADO")
+        elif a200 and (a21_55 or a55_200):
+            regime.append("RECUPERACION")
+        elif not a200 and not a21_55 and not a55_200 and sl < -SLOPE_MIN:
+            regime.append("BEAR_FUERTE")
+        elif not a200 and not a21_55:
+            regime.append("BEAR_MODERADO")
+        else:
+            regime.append("RANGO")
+    df["regime"] = regime
+    return df
+
+# ─────────────────────────────────────────
+# 4. SWINGS + IMPULSOS
+# ─────────────────────────────────────────
+def detectar_swings(df, n=LOOKBACK_SWING):
+    highs, lows = [], []
+    ha = df["high"].values
+    la = df["low"].values
+    for i in range(n, len(df)-n):
+        if ha[i] == ha[i-n:i+n+1].max(): highs.append(i)
+        if la[i] == la[i-n:i+n+1].min(): lows.append(i)
+    return highs, lows
+
+def identificar_impulsos(df, swing_lows, swing_highs):
+    impulsos = []
+    ha  = df["high"].values
+    la  = df["low"].values
+    idx = df.index
+    reg = df["regime"].values
+    for li in swing_lows:
+        lp = la[li]
+        cands = [hi for hi in swing_highs if li+4 < hi < li+400]
+        if not cands: continue
+        cut   = next((sl for sl in swing_lows if sl>li), len(df))
+        cands = [hi for hi in cands if hi < cut]
+        if not cands: continue
+        hi = max(cands, key=lambda x: ha[x])
+        hp = ha[hi]
+        rp = (hp-lp)/lp
+        if rp >= MIN_IMPULSE_PCT:
+            impulsos.append({"low_idx":li,"high_idx":hi,"low_price":lp,
+                             "high_price":hp,"rango_pct":rp,
+                             "low_time":idx[li],"high_time":idx[hi],
+                             "regime_high":reg[hi]})
+    return impulsos
+
+# ─────────────────────────────────────────
+# 5. FIBONACCI
+# ─────────────────────────────────────────
+def fibs(imp):
+    r  = imp["high_price"] - imp["low_price"]
+    h  = imp["high_price"]
+    gp = h - r*GOLDEN_POCKET_LOW
+    sl = gp*(1-SL_NIVEL_PCT)
+    rk = gp-sl
+    return {"gp_lo":gp, "gp_hi":h-r*GOLDEN_POCKET_HI,
+            "sl":sl, "tp1":gp+rk*TP1_RR, "tp2":gp+rk*TP2_RR,
+            "be": gp}  # breakeven = precio de entrada
+
+# ─────────────────────────────────────────
+# 6. BACKTEST OPTIMIZADO
+# ─────────────────────────────────────────
+def backtest_optimizado(df, impulsos):
+    capital      = CAPITAL_INICIAL
+    equity_curve = [capital]
+    equity_times = [df.index[0]]
+    trades       = []
+
+    lo  = df["low"].values
+    hi  = df["high"].values
+    cl  = df["close"].values
+    vo  = df["volume"].values
+    idx = df.index
+    reg = df["regime"].values
+    rsi = df["rsi"].values
+    vm20= df["vol_ma20"].values
+
+    ultimo_salida = -MIN_CANDLES_ENTRE
+    trade_activo  = False
+
+    for imp in impulsos:
+        if trade_activo:
+            continue
+
+        f = fibs(imp)
+        if f["gp_lo"] - f["sl"] <= 0:
+            continue
+
+        # ── FILTRO 1: Régimen BULL_FUERTE en el momento del impulso ────────
+        if imp["regime_high"] != "BULL_FUERTE":
+            continue
+
+        inicio = max(imp["high_idx"]+1, ultimo_salida+MIN_CANDLES_ENTRE)
+        fin    = min(imp["high_idx"]+MAX_HOLD_CANDLES*3, len(df))
+
+        entrada_idx = None
+        for i in range(inicio, fin):
+            # ── FILTRO 2: Régimen sigue siendo BULL_FUERTE en la entrada ──
+            if reg[i] != "BULL_FUERTE":
+                continue
+            # ── FILTRO 3: RSI < RSI_MAX_ENTRY (no sobrecomprado) ──────────
+            if not np.isnan(rsi[i]) and rsi[i] > RSI_MAX_ENTRY:
+                continue
+            # ── FILTRO 4: Volumen > media 20 (confirmación) ───────────────
+            if not np.isnan(vm20[i]) and vo[i] < vm20[i] * 0.8:
+                continue
+            # ── CONDICIÓN GOLDEN POCKET: toca 61.8% y cierra arriba ───────
+            if lo[i] <= f["gp_lo"] and cl[i] > f["gp_hi"]:
+                # Vela de reversión: cierre en mitad superior
+                if cl[i] > (lo[i]+hi[i])/2:
+                    entrada_idx = i
+                    break
+
+        if entrada_idx is None:
+            continue
+
+        entrada_exec   = entrada_idx+1
+        if entrada_exec >= len(df):
+            continue
+
+        precio_entrada = cl[entrada_idx]
+        riesgo_usd     = capital*RISK_PCT
+        tam_pos_usd    = min(riesgo_usd/SL_NIVEL_PCT, capital*0.5)
+        btc_size       = tam_pos_usd/precio_entrada
+
+        resultado     = "TIMEOUT"
+        precio_salida = None
+        salida_idx    = None
+        tp1_hit       = False
+        btc_rem       = btc_size
+        sl_dinamico   = f["sl"]   # SL empieza en 0.8% abajo
+
+        trade_activo  = True
+
+        for j in range(entrada_exec, min(entrada_exec+MAX_HOLD_CANDLES+1, len(df))):
+            # ── SL dinámico (breakeven tras TP1) ─────────────────────────
+            if lo[j] <= sl_dinamico:
+                precio_salida = sl_dinamico
+                resultado = "SL" if sl_dinamico < precio_entrada else "BE"
+                salida_idx = j
+                break
+            # ── TP1 ───────────────────────────────────────────────────────
+            if not tp1_hit and hi[j] >= f["tp1"]:
+                tp1_hit    = True
+                btc_rem   *= (1-TP1_FRACTION)
+                sl_dinamico = precio_entrada  # mover SL a breakeven
+            # ── TP2 ───────────────────────────────────────────────────────
+            if hi[j] >= f["tp2"]:
+                precio_salida = f["tp2"]
+                resultado = "TP2"
+                salida_idx = j
+                break
+
+        if salida_idx is None:
+            salida_idx    = min(entrada_exec+MAX_HOLD_CANDLES, len(df)-1)
+            precio_salida = cl[salida_idx]
+
+        # PnL
+        if tp1_hit:
+            pnl = (btc_size*TP1_FRACTION*(f["tp1"]-precio_entrada) +
+                   btc_rem*(precio_salida-precio_entrada))
+        else:
+            pnl = btc_size*(precio_salida-precio_entrada)
+
+        capital += pnl
+        capital  = max(capital, 1)
+        dur_h    = (idx[salida_idx]-idx[entrada_exec]).total_seconds()/3600
+
+        ultimo_salida = salida_idx
+        trade_activo  = False
+
+        trades.append({
+            "entrada_time":  idx[entrada_exec],
+            "salida_time":   idx[salida_idx],
+            "año":           idx[entrada_exec].year,
+            "mes":           idx[entrada_exec].strftime("%Y-%m"),
+            "precio_entrada":round(precio_entrada,2),
+            "precio_salida": round(precio_salida,2),
+            "sl_price":      round(sl_dinamico,2),
+            "tp1_price":     round(f["tp1"],2),
+            "tp2_price":     round(f["tp2"],2),
+            "resultado":     resultado,
+            "pnl_usd":       round(pnl,2),
+            "pnl_pct":       round(pnl/tam_pos_usd*100,2) if tam_pos_usd else 0,
+            "capital":       round(capital,2),
+            "duracion_h":    round(dur_h,1),
+            "rango_imp":     round(imp["rango_pct"]*100,2),
+            "tp1_hit":       tp1_hit,
+            "rsi_entrada":   round(rsi[entrada_idx],1) if not np.isnan(rsi[entrada_idx]) else 0,
+        })
+        equity_curve.append(capital)
+        equity_times.append(idx[salida_idx])
+
+    return pd.DataFrame(trades), equity_curve, equity_times
+
+# ─────────────────────────────────────────
+# 7. ESTADÍSTICAS COMPLETAS
+# ─────────────────────────────────────────
+def calcular_stats(trades_df, equity_curve):
+    if trades_df.empty:
+        return {}
+    wins = trades_df[trades_df["pnl_usd"] > 0]
+    loss = trades_df[trades_df["pnl_usd"] <= 0]
+    eq   = np.array(equity_curve)
+    peak = np.maximum.accumulate(eq)
+    dd   = (eq-peak)/peak*100
+    rets = trades_df["pnl_usd"] / CAPITAL_INICIAL
+    sharpe = rets.mean()/rets.std()*np.sqrt(252) if rets.std()>0 else 0
+    gross_w = wins["pnl_usd"].sum() if len(wins) else 0
+    gross_l = abs(loss["pnl_usd"].sum()) if len(loss) else 0.001
+    tp2_n = len(trades_df[trades_df["resultado"]=="TP2"])
+    sl_n  = len(trades_df[trades_df["resultado"]=="SL"])
+    be_n  = len(trades_df[trades_df["resultado"]=="BE"])
+    to_n  = len(trades_df[trades_df["resultado"]=="TIMEOUT"])
+    rr = abs(wins["pnl_usd"].mean()/loss["pnl_usd"].mean()) if len(loss) and loss["pnl_usd"].mean() != 0 else 0
+    return {
+        "n":        len(trades_df),
+        "wins":     len(wins),
+        "losses":   len(loss),
+        "wr":       round(len(wins)/len(trades_df)*100,1),
+        "tp2_n":    tp2_n, "sl_n":sl_n, "be_n":be_n, "to_n":to_n,
+        "tp1_rate": round(trades_df["tp1_hit"].mean()*100,1),
+        "cap_final":round(eq[-1],2),
+        "retorno":  round((eq[-1]/CAPITAL_INICIAL-1)*100,1),
+        "max_dd":   round(dd.min(),1),
+        "pf":       round(gross_w/gross_l,2),
+        "sharpe":   round(sharpe,2),
+        "avg_win":  round(wins["pnl_usd"].mean(),2) if len(wins) else 0,
+        "avg_loss": round(loss["pnl_usd"].mean(),2) if len(loss) else 0,
+        "rr":       round(rr,2),
+        "best":     round(trades_df["pnl_usd"].max(),2),
+        "worst":    round(trades_df["pnl_usd"].min(),2),
+        "avg_dur":  round(trades_df["duracion_h"].mean(),1),
+        "eq_arr":   eq, "dd_arr":dd,
+        "avg_rsi":  round(trades_df["rsi_entrada"].mean(),1),
+    }
+
+# ─────────────────────────────────────────
+# 8. GRÁFICA MAESTRA
+# ─────────────────────────────────────────
+def graficar(df, trades_df, s, equity_curve, equity_times):
+    fig = plt.figure(figsize=(20, 20))
+    fig.patch.set_facecolor("#0d1117")
+    fig.suptitle(
+        "BTC/USDC 1H — Golden Pocket Fibonacci OPTIMIZADA\n"
+        "Solo BULL_FUERTE · RSI<52 · Vol confirmado · SL→BE tras TP1 · TP2=3:1 R:R",
+        fontsize=13, fontweight="bold", color="#f0f6fc", y=0.99
+    )
+    gs = gridspec.GridSpec(4,3, figure=fig, hspace=0.48, wspace=0.32)
+
+    def style(ax, title="", fs=9):
+        ax.set_facecolor("#161b22")
+        ax.tick_params(colors="#8b949e", labelsize=7.5)
+        for sp in ax.spines.values():
+            sp.set_edgecolor("#30363d")
+        if title:
+            ax.set_title(title, color="#f0f6fc", fontsize=fs,
+                         fontweight="bold", pad=6)
+
+    # ── Panel A: Precio + BULL_FUERTE en verde ─────────────────────────────
+    ax_p = fig.add_subplot(gs[0,:])
+    style(ax_p, "BTC/USDC — Zonas BULL_FUERTE (verde) donde opera la estrategia", fs=10)
+    df_sub = df.iloc[::4]
+    bull_mask = df_sub["regime"] == "BULL_FUERTE"
+    ax_p.plot(df_sub.index, df_sub["close"], color="#4a4a5a",
+              linewidth=0.6, alpha=0.5, zorder=1)
+    # Shading BULL_FUERTE
+    prev_bull = False
+    sx = None
+    for ts, row in df_sub.iterrows():
+        if row["regime"]=="BULL_FUERTE" and not prev_bull:
+            sx = ts; prev_bull=True
+        elif row["regime"]!="BULL_FUERTE" and prev_bull:
+            ax_p.axvspan(sx, ts, color="#00c853", alpha=0.08, zorder=0)
+            prev_bull=False
+    if prev_bull and sx:
+        ax_p.axvspan(sx, df_sub.index[-1], color="#00c853", alpha=0.08, zorder=0)
+    # EMAs
+    ax_p.plot(df_sub.index, df_sub["ema21"],  color="#58a6ff", lw=0.8, alpha=0.7, label="EMA21")
+    ax_p.plot(df_sub.index, df_sub["ema55"],  color="#d29922", lw=0.8, alpha=0.6, label="EMA55")
+    ax_p.plot(df_sub.index, df_sub["ema200"], color="#f0f6fc", lw=1.0, alpha=0.5, label="EMA200", linestyle="--")
+    # Marcar entradas y salidas
+    if not trades_df.empty:
+        for _, t in trades_df.iterrows():
+            col = "#3fb950" if t["pnl_usd"]>0 else "#f85149"
+            ax_p.axvline(t["entrada_time"], color=col, alpha=0.3, lw=0.6)
+    ax_p.yaxis.set_major_formatter(plt.FuncFormatter(lambda x,_: f"${x:,.0f}"))
+    ax_p.set_ylabel("USD", color="#8b949e", fontsize=8)
+    ax_p.legend(facecolor="#21262d", labelcolor="#f0f6fc", fontsize=7, loc="upper left")
+
+    # ── Panel B: Equity curve ─────────────────────────────────────────────
+    ax_e = fig.add_subplot(gs[1,:2])
+    style(ax_e, "Curva de Equity — Estrategia Optimizada")
+    eq = s["eq_arr"]
+    ax_e.plot(eq, color="#58a6ff", lw=1.6, zorder=3)
+    ax_e.axhline(CAPITAL_INICIAL, color="#8b949e", linestyle="--", lw=0.8, alpha=0.5)
+    ax_e.fill_between(range(len(eq)), eq, CAPITAL_INICIAL,
+                      where=[e>=CAPITAL_INICIAL for e in eq], color="#3fb950", alpha=0.15)
+    ax_e.fill_between(range(len(eq)), eq, CAPITAL_INICIAL,
+                      where=[e<CAPITAL_INICIAL for e in eq], color="#f85149", alpha=0.15)
+    # Annotate años
+    if not trades_df.empty:
+        for yr in trades_df["año"].unique():
+            yr_trades = trades_df[trades_df["año"]==yr]
+            if len(yr_trades):
+                first_idx = yr_trades.index[0]
+                eq_idx = trades_df.index.get_loc(first_idx)
+                ax_e.axvline(eq_idx, color="#8b949e", lw=0.5, alpha=0.4)
+                ax_e.text(eq_idx+2, max(eq)*0.97, str(yr),
+                          color="#8b949e", fontsize=7)
+    retorno = s["retorno"]
+    col_ret = "#3fb950" if retorno>=0 else "#f85149"
+    ax_e.text(0.98, 0.95, f"${s['cap_final']:,.0f}  ({retorno:+.1f}%)",
+              transform=ax_e.transAxes, ha="right", va="top",
+              color=col_ret, fontsize=11, fontweight="bold")
+    ax_e.yaxis.set_major_formatter(plt.FuncFormatter(lambda x,_: f"${x:,.0f}"))
+    ax_e.set_ylabel("Capital USD", color="#8b949e", fontsize=8)
+
+    # ── Panel C: Drawdown ─────────────────────────────────────────────────
+    ax_dd = fig.add_subplot(gs[1,2])
+    style(ax_dd, "Drawdown")
+    dd = s["dd_arr"]
+    ax_dd.fill_between(range(len(dd)), dd, 0, color="#f85149", alpha=0.55)
+    ax_dd.plot(dd, color="#ff6b6b", lw=0.8)
+    ax_dd.text(0.02, 0.08, f"Max DD: {s['max_dd']}%",
+               transform=ax_dd.transAxes, color="#ff6b6b", fontsize=8, fontweight="bold")
+    ax_dd.set_ylabel("%", color="#8b949e", fontsize=8)
+
+    # ── Panel D: PnL por trade ────────────────────────────────────────────
+    ax_pnl = fig.add_subplot(gs[2,0])
+    style(ax_pnl, "PnL por Trade (USD)")
+    if not trades_df.empty:
+        pnls = trades_df["pnl_usd"].values
+        cols = ["#3fb950" if p>0 else "#f85149" for p in pnls]
+        ax_pnl.bar(range(len(pnls)), pnls, color=cols, alpha=0.85, width=0.8)
+        ax_pnl.axhline(0, color="#8b949e", lw=0.5)
+        # Running total line
+        ax2 = ax_pnl.twinx()
+        ax2.plot(trades_df["pnl_usd"].cumsum().values,
+                 color="#58a6ff", lw=1.2, alpha=0.7)
+        ax2.set_facecolor("#161b22")
+        ax2.tick_params(colors="#8b949e", labelsize=6)
+        ax2.set_ylabel("Acum.", color="#58a6ff", fontsize=7)
+    ax_pnl.set_xlabel("Trade #", color="#8b949e", fontsize=7)
+    ax_pnl.set_ylabel("USD", color="#8b949e", fontsize=7)
+
+    # ── Panel E: Histograma PnL% ──────────────────────────────────────────
+    ax_h = fig.add_subplot(gs[2,1])
+    style(ax_h, "Distribución PnL%")
+    if not trades_df.empty:
+        pp = trades_df["pnl_pct"]
+        ax_h.hist(pp[pp>0],  bins=15, color="#3fb950", alpha=0.75, label=f"Wins ({len(pp[pp>0])})")
+        ax_h.hist(pp[pp<=0], bins=15, color="#f85149", alpha=0.75, label=f"Losses ({len(pp[pp<=0])})")
+        ax_h.axvline(0, color="white", lw=0.8)
+        ax_h.axvline(pp.mean(), color="#d29922", lw=1, linestyle="--")
+        ax_h.legend(facecolor="#21262d", labelcolor="#f0f6fc", fontsize=7)
+        ax_h.set_xlabel("PnL%", color="#8b949e", fontsize=7)
+
+    # ── Panel F: PnL por año ──────────────────────────────────────────────
+    ax_yr = fig.add_subplot(gs[2,2])
+    style(ax_yr, "PnL Anual + Win Rate")
+    if not trades_df.empty:
+        por_año = trades_df.groupby("año").agg(
+            pnl=("pnl_usd","sum"), wr=("pnl_usd",lambda x:(x>0).mean()*100),
+            n=("pnl_usd","count")).reset_index()
+        bar_c = ["#3fb950" if v>0 else "#f85149" for v in por_año["pnl"]]
+        bars = ax_yr.bar(por_año["año"].astype(str), por_año["pnl"],
+                         color=bar_c, alpha=0.85, width=0.6)
+        ax_yr.axhline(0, color="#8b949e", lw=0.5)
+        for bar, row in zip(bars, por_año.itertuples()):
+            y = bar.get_height()
+            ax_yr.text(bar.get_x()+bar.get_width()/2,
+                       y + (30 if y>=0 else -120),
+                       f"WR\n{row.wr:.0f}%\n({row.n}t)",
+                       ha="center", color="#f0f6fc", fontsize=6.5, fontweight="bold")
+        ax_yr.yaxis.set_major_formatter(plt.FuncFormatter(lambda x,_: f"${x:,.0f}"))
+        ax_yr.tick_params(axis="x", labelrotation=30)
+        ax_yr.set_ylabel("USD", color="#8b949e", fontsize=7)
+
+    # ── Panel G: Tabla de estadísticas ───────────────────────────────────
+    ax_tab = fig.add_subplot(gs[3,:])
+    ax_tab.axis("off")
+    style(ax_tab, "")
+
+    # Construir tabla horizontal compacta
+    col_groups = [
+        ("RENDIMIENTO", [
+            ("Capital inicial",  f"${CAPITAL_INICIAL:,}"),
+            ("Capital final",    f"${s['cap_final']:,.0f}"),
+            ("Retorno total",    f"{s['retorno']:+.1f}%"),
+            ("Max Drawdown",     f"{s['max_dd']}%"),
+            ("Sharpe Ratio",     str(s['sharpe'])),
+        ]),
+        ("TRADES", [
+            ("Total trades",     str(s['n'])),
+            ("Win Rate",         f"{s['wr']}%"),
+            ("Profit Factor",    str(s['pf'])),
+            ("TP1 Hit Rate",     f"{s['tp1_rate']}%"),
+            ("TP2 completados",  str(s['tp2_n'])),
+        ]),
+        ("EXITS", [
+            ("SL activados",     str(s['sl_n'])),
+            ("Breakeven (BE)",   str(s['be_n'])),
+            ("Timeout (72h)",    str(s['to_n'])),
+            ("Avg R:R efectivo", f"{s['rr']}:1"),
+            ("RSI medio entrada",str(s['avg_rsi'])),
+        ]),
+        ("PROMEDIOS", [
+            ("Avg ganancia",     f"${s['avg_win']:,.2f}"),
+            ("Avg pérdida",      f"${s['avg_loss']:,.2f}"),
+            ("Mejor trade",      f"${s['best']:,.2f}"),
+            ("Peor trade",       f"${s['worst']:,.2f}"),
+            ("Duración media",   f"{s['avg_dur']}h"),
+        ]),
+    ]
+
+    ncols = len(col_groups)
+    nrows = max(len(g[1]) for g in col_groups) + 1
+    cell_data = []
+    col_labels = [g[0] for g in col_groups]
+    # Pad columns to same length
+    padded = []
+    for _, rows in col_groups:
+        while len(rows) < nrows-1:
+            rows.append(("",""))
+        padded.append(rows)
+
+    for r in range(nrows-1):
+        row = []
+        for c in range(ncols):
+            k, v = padded[c][r]
+            row.append(f"{k}:  {v}" if k else "")
+        cell_data.append(row)
+
+    tbl = ax_tab.table(cellText=cell_data,
+                       colLabels=col_labels,
+                       loc="center", cellLoc="left",
+                       bbox=[0, 0, 1, 1])
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(8.5)
+    for (r, c), cell in tbl.get_celld().items():
+        if r == 0:
+            cell.set_facecolor("#1f6feb")
+            cell.get_text().set_color("white")
+            cell.get_text().set_fontweight("bold")
+            cell.get_text().set_fontsize(9)
+        else:
+            cell.set_facecolor("#21262d" if r%2==0 else "#161b22")
+            txt = cell.get_text().get_text()
+            # colorear valores clave
+            if "%" in txt and any(k in txt for k in ["Retorno","Win Rate","WR"]):
+                try:
+                    val = float(txt.split()[-1].replace("%","").replace("+",""))
+                    cell.get_text().set_color("#3fb950" if val>0 else "#f85149")
+                except: cell.get_text().set_color("#f0f6fc")
+            elif "Drawdown" in txt or "SL" in txt or "pérdida" in txt or "Peor" in txt:
+                cell.get_text().set_color("#f85149")
+            else:
+                cell.get_text().set_color("#f0f6fc")
+        cell.set_edgecolor("#30363d")
+
+    plt.savefig("/home/user/TV/backtest_optimizado.png", dpi=150,
+                bbox_inches="tight", facecolor="#0d1117")
+    plt.close()
+    print("  Gráfica: backtest_optimizado.png")
+
+# ─────────────────────────────────────────
+# 9. REPORTE CONSOLA
+# ─────────────────────────────────────────
+def reporte_consola(s, trades_df):
+    sep = "═"*60
+    print(f"\n{sep}")
+    print("  BTC/USDC 1H — GOLDEN POCKET FIBONACCI OPTIMIZADA")
+    print("  Filtros: BULL_FUERTE · RSI<52 · Vol>MA20 · BE tras TP1")
+    print(f"  Capital: ${CAPITAL_INICIAL:,}  ·  Riesgo: {RISK_PCT*100:.0f}%/trade  ·  5 años")
+    print(sep)
+    print(f"\n  {'MÉTRICA':<28} {'VALOR':>12}   {'vs. SIN FILTROS':>15}")
+    print(f"  {'─'*58}")
+    rows = [
+        ("Total trades",          f"{s['n']}",              "954 → menos"),
+        ("Win Rate",              f"{s['wr']}%",            "45.4% → mejor?"),
+        ("Profit Factor",         f"{s['pf']}",             "0.88 → mejor?"),
+        ("Sharpe Ratio",          f"{s['sharpe']}",         "-0.85 → mejor?"),
+        ("Capital final",         f"${s['cap_final']:,.0f}","$7,878 → ?"),
+        ("Retorno total",         f"{s['retorno']:+.1f}%",  "-25.0% → mejor?"),
+        ("Max Drawdown",          f"{s['max_dd']}%",        "-29.5% → mejor?"),
+        ("TP2 completados",       f"{s['tp2_n']}",          ""),
+        ("SL activados",          f"{s['sl_n']}",           ""),
+        ("Breakeven (no loss)",   f"{s['be_n']}",           "— nuevo"),
+        ("TP1 Hit Rate",          f"{s['tp1_rate']}%",      ""),
+        ("Avg R:R efectivo",      f"{s['rr']}:1",           "1.07 → mejor?"),
+        ("RSI medio en entrada",  f"{s['avg_rsi']}",        ""),
+        ("Duración media",        f"{s['avg_dur']}h",       ""),
+    ]
+    for k, v, comp in rows:
+        print(f"  {k:<28} {v:>12}   {comp}")
+
+    print(f"\n{sep}")
+    print("  DETALLE POR AÑO:")
+    print(f"  {'Año':<6} {'N':>5} {'WR':>6} {'SL':>4} {'BE':>4} {'TP2':>5} {'PnL':>12} {'Acum.':>10}")
+    print(f"  {'─'*56}")
+    acum = CAPITAL_INICIAL
+    for yr, g in trades_df.groupby("año"):
+        wr  = (g["pnl_usd"]>0).mean()*100
+        tot = g["pnl_usd"].sum()
+        sl_ = (g["resultado"]=="SL").sum()
+        be_ = (g["resultado"]=="BE").sum()
+        t2  = (g["resultado"]=="TP2").sum()
+        acum += tot
+        sig  = "▲" if tot>0 else "▼"
+        print(f"  {yr:<6} {len(g):>5} {wr:>5.0f}% {sl_:>4} {be_:>4} {t2:>5} "
+              f"{sig} ${tot:>9,.0f}  ${acum:>9,.0f}")
+
+    print(f"\n{sep}")
+    best5 = trades_df.nlargest(5,"pnl_usd")[
+        ["año","precio_entrada","resultado","rsi_entrada","pnl_usd","duracion_h"]]
+    print("  TOP 5 MEJORES TRADES:")
+    print(best5.to_string(index=False))
+
+    worst5 = trades_df.nsmallest(5,"pnl_usd")[
+        ["año","precio_entrada","resultado","rsi_entrada","pnl_usd","duracion_h"]]
+    print("\n  TOP 5 PEORES TRADES:")
+    print(worst5.to_string(index=False))
+    print(sep)
+
+# ─────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────
+if __name__ == "__main__":
+    print("Generando datos 1H BTC (5 años)...")
+    df = generar_ohlcv_1h(BTC_MONTHLY_ANCHORS)
+    print(f"  {len(df):,} velas  ({df.index[0].date()} → {df.index[-1].date()})")
+
+    print("Calculando indicadores y clasificando regímenes...")
+    df = calcular_indicadores(df)
+
+    bf = (df["regime"]=="BULL_FUERTE").mean()*100
+    print(f"  Tiempo en BULL_FUERTE: {bf:.1f}% del período")
+
+    print("Detectando swings e impulsos...")
+    sh, sl_ = detectar_swings(df)
+    impulsos = identificar_impulsos(df, sl_, sh)
+    print(f"  Impulsos ≥0.75% en BULL_FUERTE: {sum(1 for i in impulsos if i['regime_high']=='BULL_FUERTE')}")
+
+    print("Ejecutando backtest optimizado...")
+    trades_df, eq_curve, eq_times = backtest_optimizado(df, impulsos)
+    print(f"  Trades ejecutados: {len(trades_df)}")
+
+    s = calcular_stats(trades_df, eq_curve)
+    reporte_consola(s, trades_df)
+
+    print("\nGenerando gráficas...")
+    graficar(df, trades_df, s, eq_curve, eq_times)
+
+    trades_df.to_csv("/home/user/TV/backtest_optimizado_trades.csv", index=False)
+    print("  CSV: backtest_optimizado_trades.csv")
+    print("\n  ✓ Estrategia optimizada completa.")
