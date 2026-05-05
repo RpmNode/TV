@@ -1,15 +1,15 @@
 """
 BTC/USDC 1H — Golden Pocket Fibonacci OPTIMIZADA
 Régimen: BULL_FUERTE | RSI(14) | MACD(12,26,9) | ADX(14)
-Scale-in: +0.5 contratos en zona 65% si el precio profundiza tras la entrada
+Ampliación: +0.5 contratos en zona 65% si el precio profundiza tras la entrada
 
 Estructura de posición:
-  Entrada 1 (E1): 61.8% GP — 1 unidad (riesgo 1% capital)
-  Scale-in (E2):  65.0%     — 0.5 unidades adicionales
-  SL común:       78.6% del impulso
-  TP1:            1:1 R:R desde precio medio ponderado
-  TP2:            3:1 R:R desde precio medio ponderado
-  BE:             SL → precio E1 tras TP1
+  Entrada 1 (E1):      61.8% GP — 1 unidad (riesgo 1% capital)
+  Ampliación (E2):     65.0%    — 0.5 unidades adicionales
+  SL común:            78.6% del impulso
+  TP1:                 1:1 R:R desde precio medio ponderado
+  TP2:                 3:1 R:R desde precio medio ponderado
+  Breakeven (BE):      SL → precio E1 tras alcanzar TP1
 """
 
 import pandas as pd
@@ -52,8 +52,8 @@ ADX_PERIOD         = 14
 ADX_MIN            = 20          # ADX > 20 → tendencia moderada/fuerte
 VOL_MA_PERIOD      = 20
 SL_LEVEL           = 0.786       # SL estructural en 78.6% del impulso
-SCALE_IN_LEVEL     = 0.650       # scale-in al 65% (profundiza desde 61.8%)
-SCALE_IN_FACTOR    = 0.50        # añadir 0.5 contratos (50% de la pos. inicial)
+SCALE_IN_LEVEL     = 0.650       # ampliación al 65% (profundiza desde 61.8%)
+SCALE_IN_FACTOR    = 0.50        # 0.5 contratos adicionales (50% de la posición inicial)
 MIN_CANDLES_ENTRE  = 12
 SLOPE_WINDOW       = 24          # ventana para pendiente EMA200 (24h)
 SLOPE_MIN          = 0.0005      # pendiente mínima EMA200 (0.05%/24h)
@@ -304,13 +304,13 @@ def fibs(imp):
     r       = imp["high_price"] - imp["low_price"]
     h       = imp["high_price"]
     gp      = h - r * GOLDEN_POCKET_LOW    # 61.8%  — entrada E1
-    scale   = h - r * SCALE_IN_LEVEL       # 65.0%  — scale-in E2
+    scale   = h - r * SCALE_IN_LEVEL       # 65.0%  — ampliación E2
     sl_base = h - r * SL_LEVEL             # 78.6%  — SL estructural
     rk      = gp - sl_base                 # riesgo desde E1
     return {
         "gp_lo":  gp,
         "gp_hi":  h - r * GOLDEN_POCKET_HI,
-        "scale":  scale,                    # nivel de scale-in
+        "scale":  scale,                    # nivel de ampliación de posición
         "sl":     sl_base,
         "tp1":    gp + rk * TP1_RR,
         "tp2":    gp + rk * TP2_RR,
@@ -416,16 +416,16 @@ def backtest_optimizado(df, impulsos):
         tam_pos_usd = min(riesgo_usd / SL_NIVEL_PCT, capital * 0.5)
         btc_e1      = tam_pos_usd / precio_e1
 
-        # Variables de scale-in (E2 en 65%)
+        # Variables de ampliación de posición (E2 en 65%)
         scale_hit   = False
         btc_e2      = 0.0
         precio_e2   = 0.0
 
-        # Posición total inicial (puede crecer con scale-in)
+        # Posición total inicial (crece si se activa la ampliación)
         btc_total   = btc_e1
         avg_entry   = precio_e1
 
-        # TP1/TP2 calculados desde E1 inicialmente (se recalculan tras scale-in)
+        # TP1/TP2 calculados desde E1; se recalculan tras la ampliación
         tp1_price   = f["tp1"]
         tp2_price   = f["tp2"]
 
@@ -446,14 +446,14 @@ def backtest_optimizado(df, impulsos):
                 salida_idx = j
                 break
 
-            # ── Scale-in E2: profundiza a 65% ────────────────────────────
+            # ── Ampliación E2: el precio profundiza hasta 65% ────────────
             if not scale_hit and not tp1_hit and lo[j] <= f["scale"]:
                 scale_hit  = True
                 precio_e2  = f["scale"]
                 btc_e2     = btc_e1 * SCALE_IN_FACTOR
                 btc_total  = btc_e1 + btc_e2
                 avg_entry  = (btc_e1 * precio_e1 + btc_e2 * precio_e2) / btc_total
-                # Recalcular TP1/TP2 desde precio medio
+                # Recalcular TP1/TP2 desde el precio medio ponderado
                 rk_avg     = avg_entry - f["sl"]
                 tp1_price  = avg_entry + rk_avg * TP1_RR
                 tp2_price  = avg_entry + rk_avg * TP2_RR
@@ -476,9 +476,9 @@ def backtest_optimizado(df, impulsos):
             salida_idx    = min(entrada_exec+MAX_HOLD_CANDLES, len(df)-1)
             precio_salida = cl[salida_idx]
 
-        # ── PnL — dos tramos (E1 siempre, E2 si scale_hit) ───────────────
+        # ── PnL — dos tramos (E1 siempre, E2 si se activó ampliación) ───────
         if tp1_hit:
-            # Mitad TP1 al precio TP1, resto al precio_salida (desde avg_entry)
+            # Mitad al precio TP1, el resto al precio de salida (desde precio medio)
             pnl = (btc_total * TP1_FRACTION * (tp1_price - avg_entry) +
                    btc_rem * (precio_salida - avg_entry))
         else:
@@ -823,7 +823,7 @@ def graficar(df, trades_df, s, equity_curve, equity_times):
             ("Profit Factor",    str(s['pf'])),
             ("TP1 Hit Rate",     f"{s['tp1_rate']}%"),
             ("TP2 completados",  str(s['tp2_n'])),
-            ("Scale-in hits",    f"{s['scale_n']} ({s['scale_pct']}%)"),
+            ("Ampliaciones (E2)", f"{s['scale_n']} ({s['scale_pct']}%)"),
         ]),
         ("EXITS", [
             ("SL activados",     str(s['sl_n'])),
@@ -917,7 +917,7 @@ def reporte_consola(s, trades_df):
         ("SL activados",          f"{s['sl_n']}",           ""),
         ("Breakeven (no loss)",   f"{s['be_n']}",           "— nuevo"),
         ("TP1 Hit Rate",          f"{s['tp1_rate']}%",      ""),
-        ("Scale-in hits",         f"{s['scale_n']} ({s['scale_pct']}%)", "— nuevo"),
+        ("Ampliaciones E2 (65%)", f"{s['scale_n']} ({s['scale_pct']}%)", "— nuevo"),
         ("Avg R:R efectivo",      f"{s['rr']}:1",           "1.07 → mejor?"),
         ("RSI medio en entrada",  f"{s['avg_rsi']}",        ""),
         ("ADX medio en entrada",  f"{s['avg_adx']}",        ""),
