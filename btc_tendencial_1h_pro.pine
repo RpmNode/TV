@@ -1,5 +1,12 @@
 //@version=5
-strategy("BTC Tendencial 1H PRO", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=1)
+strategy("BTC Tendencial 1H PRO", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=1,
+     commission_type=strategy.commission.percent, commission_value=0.05,
+     slippage=2)
+
+// === RANGO DE FECHAS PARA BACKTEST ===
+i_startDate = input.time(timestamp("2019-01-01 00:00"), title="Fecha inicio", group="Backtest")
+i_endDate   = input.time(timestamp("2024-12-31 23:59"), title="Fecha fin",   group="Backtest")
+inDateRange = time >= i_startDate and time <= i_endDate
 
 // === MEDIAS ===
 sma20  = ta.sma(close, 20)
@@ -43,7 +50,7 @@ lowerWick   = math.min(open, close) - low
 wickFilter  = candleRange > 0 and (upperWick / candleRange < 0.6) and (lowerWick / candleRange < 0.6)
 
 // === ENTRADA ===
-longCondition = macroFilter and trendLong and momentumLong and volatilityOK and pullback and wickFilter and close > high[1]
+longCondition = inDateRange and macroFilter and trendLong and momentumLong and volatilityOK and pullback and wickFilter and close > high[1]
 
 // === STOP Y TP fijados en el momento de entrada (corregido: ya no se recalculan cada barra) ===
 var float entryStop = na
@@ -55,6 +62,10 @@ if longCondition
     strategy.entry("LONG", strategy.long)
 
 strategy.exit("TP/SL", from_entry="LONG", stop=entryStop, limit=entryTP)
+
+// Cierra posición al terminar el rango de backtest
+if time > i_endDate and strategy.position_size > 0
+    strategy.close("LONG", comment="Fin backtest")
 
 // === PLOTS ===
 plot(sma20,  color=color.blue,   title="SMA 20")
