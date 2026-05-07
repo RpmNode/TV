@@ -51,7 +51,8 @@ MACD_SIGNAL        = 9
 ADX_PERIOD         = 14
 ADX_MIN            = 20          # ADX > 20 → tendencia moderada/fuerte
 VOL_MA_PERIOD      = 20
-SL_LEVEL           = 0.786       # SL estructural en 78.6% del impulso
+ATR_SL_MULT        = 1.5         # SL a 1.5 × ATR por debajo de la entrada
+SL_LEVEL           = 0.786       # SL Fibonacci de respaldo (si ATR no disponible)
 SCALE_IN_LEVEL     = 0.650       # ampliación al 65% (profundiza desde 61.8%)
 SCALE_IN_FACTOR    = 0.50        # 0.5 contratos adicionales (50% de la posición inicial)
 MIN_CANDLES_ENTRE  = 12
@@ -340,6 +341,7 @@ def backtest_optimizado(df, impulsos):
     pdi  = df["plus_di"].values
     mdi  = df["minus_di"].values
     vm20 = df["vol_ma20"].values
+    atr_ = df["atr"].values
 
     ultimo_salida = -MIN_CANDLES_ENTRE
     trade_activo  = False
@@ -411,10 +413,28 @@ def backtest_optimizado(df, impulsos):
             continue
 
         # ── E1: entrada principal en 61.8% GP ────────────────────────────
-        precio_e1   = cl[entrada_idx]
-        riesgo_usd  = capital * RISK_PCT
-        tam_pos_usd = min(riesgo_usd / SL_NIVEL_PCT, capital * 0.5)
-        btc_e1      = tam_pos_usd / precio_e1
+        precio_e1  = cl[entrada_idx]
+        riesgo_usd = capital * RISK_PCT
+
+        # SL basado en ATR: 1.5 × ATR por debajo de la entrada
+        atr_val    = atr_[entrada_idx]
+        if np.isnan(atr_val) or atr_val <= 0:
+            atr_val = f["gp_lo"] - f["sl"]   # respaldo Fibonacci si ATR no disponible
+        sl_dist    = ATR_SL_MULT * atr_val
+        sl_atr     = precio_e1 - sl_dist
+
+        # Tamaño de posición: riesgo fijo / distancia ATR
+        btc_e1      = riesgo_usd / sl_dist
+        tam_pos_usd = btc_e1 * precio_e1
+        # Cap: no más del 50% del capital en una posición
+        if tam_pos_usd > capital * 0.5:
+            tam_pos_usd = capital * 0.5
+            btc_e1      = tam_pos_usd / precio_e1
+            sl_dist     = riesgo_usd / btc_e1   # recalcular distancia real
+
+        # TPs a 1:1 y 3:1 desde la distancia ATR
+        tp1_price = precio_e1 + sl_dist * TP1_RR
+        tp2_price = precio_e1 + sl_dist * TP2_RR
 
         # Variables de ampliación de posición (E2 en 65%)
         scale_hit   = False
@@ -425,16 +445,12 @@ def backtest_optimizado(df, impulsos):
         btc_total   = btc_e1
         avg_entry   = precio_e1
 
-        # TP1/TP2 calculados desde E1; se recalculan tras la ampliación
-        tp1_price   = f["tp1"]
-        tp2_price   = f["tp2"]
-
         resultado     = "TIMEOUT"
         precio_salida = None
         salida_idx    = None
         tp1_hit       = False
         btc_rem       = btc_total
-        sl_dinamico   = f["sl"]   # SL estructural en 78.6%
+        sl_dinamico   = sl_atr   # SL dinámico basado en ATR
 
         trade_activo  = True
 
