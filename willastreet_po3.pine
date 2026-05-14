@@ -1,4 +1,22 @@
 //@version=5
+// ═══════════════════════════════════════════════════════════════════════════
+// WILLASTREET – Power of Three  [MNQ / Índices]
+// ═══════════════════════════════════════════════════════════════════════════
+// Estrategia basada en el vídeo "Esta estrategia de trading es Aburrida…"
+//
+// LÓGICA (fiel al vídeo):
+//   Vela 1 (Acumulación) → 3H de las 6:00 ET  → define el rango Hi/Lo
+//   Vela 2 (Manipulación)→ 3H de las 9:00 ET  → toma el Hi o Lo de la vela 1
+//   Vela 3 (Distribución)→ entrada en 5M dentro de la KZ (9:00–10:30 ET)
+//
+//   • Entrada: Buy/Sell Stop en el primer pivot High/Low del 5M tras la barrida
+//   • SL : extremo de la manipulación – buffer
+//   • TP : Hi de la vela 1 (largos) / Lo de la vela 1 (cortos)
+//   • Break even obligatorio a las 11:00 ET si el trade sigue abierto
+//   • Modelo continuación: manipulación ya ocurrida en la vela de las 6
+//   • Sin operación si el patrón no aparece dentro de la hora y media de KZ
+// ═══════════════════════════════════════════════════════════════════════════
+
 strategy("Willastreet PO3 [MNQ]",
      shorttitle         = "WS·PO3",
      overlay            = true,
@@ -9,303 +27,361 @@ strategy("Willastreet PO3 [MNQ]",
      slippage           = 2,
      calc_on_every_tick = false)
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────
 // INPUTS
-// ═══════════════════════════════════════════════════════════════════════════
-GRP_KZ   = "Kill Zone  (NY default: 9:30 – 11:00 ET)"
-GRP_PO3  = "PO3 Detection"
-GRP_RISK = "Risk Management"
-GRP_HTF  = "HTF Trend Filter  (3H recomendado)"
+// ─────────────────────────────────────────────────────────────────
+GRP_KZ   = "Kill Zone  [NY: 9:00 – 10:30 ET]"
+GRP_PO3  = "PO3 / Entradas"
+GRP_RISK = "Riesgo"
 GRP_VIS  = "Visuals"
 
-// ── Kill Zone ──────────────────────────────────────────────────────────────
-i_kz_h1       = input.int(9,    "Start Hour  (ET)",              minval=0, maxval=23, group=GRP_KZ)
-i_kz_m1       = input.int(30,   "Start Minute",                  minval=0, maxval=59, group=GRP_KZ)
-i_kz_h2       = input.int(11,   "End Hour    (ET)",              minval=0, maxval=23, group=GRP_KZ)
-i_kz_m2       = input.int(0,    "End Minute",                    minval=0, maxval=59, group=GRP_KZ)
+i_kz_h1   = input.int(9,  "KZ Hora inicio (ET)", minval=0, maxval=23, group=GRP_KZ)
+i_kz_m1   = input.int(0,  "KZ Min  inicio",      minval=0, maxval=59, group=GRP_KZ)
+i_kz_h2   = input.int(10, "KZ Hora fin   (ET)", minval=0, maxval=23, group=GRP_KZ)
+i_kz_m2   = input.int(30, "KZ Min  fin",         minval=0, maxval=59, group=GRP_KZ)
 
-// ── PO3 Detection ─────────────────────────────────────────────────────────
-i_acc_bars    = input.int(30,   "Accum Lookback (bars)",
-     minval=5, maxval=500, group=GRP_PO3,
-     tooltip="Barras previas al inicio de la Kill Zone usadas para definir el rango de acumulación. En 5M → 30 barras ≈ 2h30m.")
-i_sweep_ticks = input.int(4,    "Min Sweep beyond range (ticks)",
-     minval=1, maxval=200, group=GRP_PO3,
-     tooltip="Ticks mínimos que el precio debe superar el rango para que la barrera/manipulación sea válida.")
+i_be_h    = input.int(11, "Break Even hora (ET)", minval=0, maxval=23, group=GRP_PO3,
+                 tooltip="Mueve el SL a entry price a esta hora si el trade sigue abierto")
+i_be_m    = input.int(0,  "Break Even min",        minval=0, maxval=59, group=GRP_PO3)
 
-// ── Risk Management ───────────────────────────────────────────────────────
-i_rr          = input.float(2.0, "Risk/Reward Ratio",
-     minval=1.0, maxval=10.0, step=0.25, group=GRP_RISK)
-i_sl_buf      = input.int(4,    "SL Buffer (ticks)",
-     minval=0, maxval=50, group=GRP_RISK,
-     tooltip="Ticks adicionales más allá del extremo de la manipulación para colocar el Stop Loss.")
+i_sweep_ticks = input.int(4, "Min barrida (ticks más allá del rango)",
+                 minval=1, maxval=200, group=GRP_PO3,
+                 tooltip="Ticks mínimos que el precio debe superar el rango para validar la manipulación")
 
-// ── HTF Filter ────────────────────────────────────────────────────────────
-i_use_htf     = input.bool(true,  "Enable HTF Filter",           group=GRP_HTF)
-i_htf_tf      = input.timeframe("180", "HTF Timeframe",          group=GRP_HTF)
-i_htf_ema_len = input.int(20,    "HTF EMA Length",               group=GRP_HTF)
+i_pivot_lb = input.int(2, "Pivot – barras izquierda", minval=1, maxval=10, group=GRP_PO3)
+i_pivot_rb = input.int(2, "Pivot – barras derecha",   minval=1, maxval=10, group=GRP_PO3,
+                 tooltip="Barras de confirmación del pivot. Lag total = barras derecha × TF (en 5M: 2 barras = 10 min)")
 
-// ── Visuals ───────────────────────────────────────────────────────────────
-i_show_kz     = input.bool(true, "Show Kill Zone BG",            group=GRP_VIS)
-i_show_range  = input.bool(true, "Show Accumulation Range",      group=GRP_VIS)
-i_show_eq     = input.bool(true, "Show Equilibrium (0.5)",       group=GRP_VIS)
-i_show_manip  = input.bool(true, "Show Manipulation Zone",       group=GRP_VIS)
-i_show_table  = input.bool(true, "Show Status Table",            group=GRP_VIS)
-i_col_kz      = input.color(color.new(color.blue,   88), "Kill Zone BG",       group=GRP_VIS)
-i_col_range   = input.color(color.red,                   "Range Lines",        group=GRP_VIS)
-i_col_manip_l = input.color(color.new(color.teal,   70), "Manip Zone (Long)",  group=GRP_VIS)
-i_col_manip_s = input.color(color.new(color.orange, 70), "Manip Zone (Short)", group=GRP_VIS)
+i_use_cont = input.bool(true, "Detectar modelo continuación",     group=GRP_PO3,
+                 tooltip="Si la vela de las 6 ya barrió la vela de las 3, se activa directamente la fase 2")
 
-// ═══════════════════════════════════════════════════════════════════════════
-// SESSION HELPERS
-// ═══════════════════════════════════════════════════════════════════════════
-TZ       = "America/New_York"
-tod_min  = hour(time, TZ) * 60 + minute(time, TZ)
-kz_start = i_kz_h1 * 60 + i_kz_m1
-kz_end   = i_kz_h2 * 60 + i_kz_m2
+i_sl_buf   = input.int(4, "SL buffer (ticks)", minval=0, maxval=50, group=GRP_RISK,
+                 tooltip="Ticks adicionales más allá del extremo de la barrida para el Stop Loss")
 
-in_kz    = tod_min >= kz_start and tod_min < kz_end
-kz_open  = in_kz and not in_kz[1]    // primer bar de la KZ
-kz_close = not in_kz and in_kz[1]    // primer bar tras el cierre de la KZ
+i_show_kz    = input.bool(true,                         "Kill Zone BG",   group=GRP_VIS)
+i_show_range = input.bool(true,                         "Range Lines",    group=GRP_VIS)
+i_show_eq    = input.bool(true,                         "Equilibrio 0.5", group=GRP_VIS)
+i_show_manip = input.bool(true,                         "Manip Zone",     group=GRP_VIS)
+i_show_trig  = input.bool(true,                         "Trigger Line",   group=GRP_VIS)
+i_show_table = input.bool(true,                         "Status Table",   group=GRP_VIS)
+i_col_kz     = input.color(color.new(color.blue,   88), "KZ BG",          group=GRP_VIS)
+i_col_range  = input.color(color.red,                   "Range Lines",    group=GRP_VIS)
+i_col_manip_l= input.color(color.new(color.teal,   70), "Manip Long",     group=GRP_VIS)
+i_col_manip_s= input.color(color.new(color.orange, 70), "Manip Short",    group=GRP_VIS)
+i_col_trig_l = input.color(color.new(color.lime,   20), "Trigger Long",   group=GRP_VIS)
+i_col_trig_s = input.color(color.new(color.orange, 20), "Trigger Short",  group=GRP_VIS)
 
-// ═══════════════════════════════════════════════════════════════════════════
-// HTF TREND  (3H por defecto)
-// Sesgo alcista si el precio cierra por encima de su EMA en HTF.
-// ═══════════════════════════════════════════════════════════════════════════
-[htf_close, htf_ema] = request.security(
-     syminfo.tickerid, i_htf_tf,
-     [close, ta.ema(close, i_htf_ema_len)],
-     lookahead = barmerge.lookahead_off)
+// ─────────────────────────────────────────────────────────────────
+// TIMEZONE / SESIÓN
+// ─────────────────────────────────────────────────────────────────
+TZ     = "America/New_York"
+tod    = hour(time, TZ) * 60 + minute(time, TZ)
+kz_s   = i_kz_h1 * 60 + i_kz_m1
+kz_e   = i_kz_h2 * 60 + i_kz_m2
+be_tod = i_be_h  * 60 + i_be_m
 
-bias_bull = not i_use_htf or htf_close > htf_ema
-bias_bear = not i_use_htf or htf_close < htf_ema
+in_kz   = tod >= kz_s and tod < kz_e
+kz_open = in_kz and not in_kz[1]          // primer bar de la KZ
+kz_cls  = not in_kz and in_kz[1]          // primer bar tras la KZ
+be_fire = tod == be_tod                    // 11:00 ET → break even
 
-// ═══════════════════════════════════════════════════════════════════════════
-// FASE 1 – ACUMULACIÓN
-// Al abrir la Kill Zone se hace un snapshot del rango de las últimas
-// i_acc_bars velas (captura el rango pre-mercado / sesión asiática/Londres).
-// ═══════════════════════════════════════════════════════════════════════════
-var float acc_hi = na
-var float acc_lo = na
+tick = syminfo.mintick
 
+// ─────────────────────────────────────────────────────────────────
+// DATOS 3H  (velas de referencia)
+// ─────────────────────────────────────────────────────────────────
+// vela[1] en 3H = "vela de las 6"  (6:00–9:00 ET) → Candle 1 / rango
+// vela[2] en 3H = "vela de las 3"  (3:00–6:00 ET) → para modelo continuación
+h3_c1_hi = request.security(syminfo.tickerid, "180", high[1], barmerge.gaps_off, barmerge.lookahead_off)
+h3_c1_lo = request.security(syminfo.tickerid, "180", low[1],  barmerge.gaps_off, barmerge.lookahead_off)
+h3_c2_hi = request.security(syminfo.tickerid, "180", high[2], barmerge.gaps_off, barmerge.lookahead_off)
+h3_c2_lo = request.security(syminfo.tickerid, "180", low[2],  barmerge.gaps_off, barmerge.lookahead_off)
+
+// ─────────────────────────────────────────────────────────────────
+// ESTADO POR SESIÓN
+// ─────────────────────────────────────────────────────────────────
+var float acc_hi  = na      // alto de la vela de las 6 (TP para largos)
+var float acc_lo  = na      // bajo de la vela de las 6 (TP para cortos)
+
+var bool  swept_dn = false  // barrida por abajo → setup largo
+var bool  swept_up = false  // barrida por arriba → setup corto
+var float manip_lo = na     // extremo más bajo de la barrida (referencia SL largo)
+var float manip_hi = na     // extremo más alto de la barrida (referencia SL corto)
+
+var float trig_l   = na     // nivel del Buy Stop (pivot high en 5M)
+var float trig_s   = na     // nivel del Sell Stop (pivot low en 5M)
+var float sl_l     = na     // SL calculado para el largo
+var float sl_s     = na     // SL calculado para el corto
+
+var bool  box_l_done = false
+var bool  box_s_done = false
+var box   box_dn  = na
+var box   box_up  = na
+
+var bool  entry_done_l = false
+var bool  entry_done_s = false
+var float entry_px     = na     // precio de entrada (para break even)
+var float active_tp    = na     // TP activo del trade abierto
+
+// ─────────────────────────────────────────────────────────────────
+// RESET AL INICIO DE CADA KZ
+// ─────────────────────────────────────────────────────────────────
 if kz_open
-    acc_hi := ta.highest(high, i_acc_bars)
-    acc_lo  := ta.lowest(low,  i_acc_bars)
+    // Vela 1 = vela de las 6 (default)
+    acc_hi := h3_c1_hi
+    acc_lo  := h3_c1_lo
 
-rng_size   = nz(acc_hi - acc_lo)
-tick       = syminfo.mintick
+    swept_dn    := false
+    swept_up    := false
+    manip_lo    := na
+    manip_hi    := na
+    trig_l      := na
+    trig_s      := na
+    sl_l        := na
+    sl_s        := na
+    box_l_done  := false
+    box_s_done  := false
+    box_dn      := na
+    box_up      := na
+    entry_done_l := false
+    entry_done_s := false
+    entry_px    := na
+    active_tp   := na
+
+    // ── MODELO CONTINUACIÓN ────────────────────────────────────────
+    // La vela de las 6 ya barrió la vela de las 3 antes de la KZ
+    if i_use_cont
+        sweep_thresh = i_sweep_ticks * tick
+        // Continuación larga: vela de las 6 tomó el bajo de la vela de las 3
+        if h3_c1_lo < h3_c2_lo - sweep_thresh
+            acc_hi   := h3_c2_hi   // Candle 1 pasa a ser la vela de las 3
+            acc_lo   := h3_c2_lo
+            swept_dn := true
+            manip_lo := h3_c1_lo
+
+        // Continuación corta: vela de las 6 tomó el alto de la vela de las 3
+        if h3_c1_hi > h3_c2_hi + sweep_thresh
+            acc_hi   := h3_c2_hi
+            acc_lo   := h3_c2_lo
+            swept_up := true
+            manip_hi := h3_c1_hi
+
+// ─────────────────────────────────────────────────────────────────
+// FASE 2 – MANIPULACIÓN (barrida dentro de la KZ)
+// ─────────────────────────────────────────────────────────────────
 sweep_dist = i_sweep_ticks * tick
 
-// ═══════════════════════════════════════════════════════════════════════════
-// FASE 2 – MANIPULACIÓN (Stop Hunt)
-// Se activa cuando el precio supera el rango por sweep_dist.
-//   • swept_dn → barrida por abajo (stop hunt de largos → posible entrada larga)
-//   • swept_up → barrida por arriba (stop hunt de cortos → posible entrada corta)
-// ═══════════════════════════════════════════════════════════════════════════
-var bool  swept_dn = false
-var bool  swept_up = false
-var float manip_lo = na     // extremo más bajo de la barrida (referencia para SL largo)
-var float manip_hi = na     // extremo más alto de la barrida (referencia para SL corto)
-var int   dn_bi    = na     // bar_index del inicio de la barrida bajista
-var int   up_bi    = na     // bar_index del inicio de la barrida alcista
-
-// Una operación por dirección por sesión de KZ
-var bool traded_long  = false
-var bool traded_short = false
-
-if kz_open
-    swept_dn      := false
-    swept_up      := false
-    manip_lo      := na
-    manip_hi      := na
-    dn_bi         := na
-    up_bi         := na
-    traded_long   := false
-    traded_short  := false
-
-if in_kz and not na(acc_lo) and not na(acc_hi) and rng_size > 0
-    // Barrida bajista: precio perfora por debajo de acc_lo
+if in_kz and not na(acc_lo) and not na(acc_hi)
     if low < acc_lo - sweep_dist
         if not swept_dn
             swept_dn := true
-            dn_bi    := bar_index
             manip_lo := low
         else
             manip_lo := math.min(manip_lo, low)
 
-    // Barrida alcista: precio perfora por encima de acc_hi
     if high > acc_hi + sweep_dist
         if not swept_up
             swept_up := true
-            up_bi    := bar_index
             manip_hi := high
         else
             manip_hi := math.max(manip_hi, high)
 
-// ═══════════════════════════════════════════════════════════════════════════
-// FASE 3 – DISTRIBUCIÓN (Señal de entrada)
-// Después de la barrida, el precio recupera el rango → entrada en la dirección
-// del Smart Money (contraria a la barrida).
-// ═══════════════════════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────
+// CAJAS VISUALES DE MANIPULACIÓN
+// ─────────────────────────────────────────────────────────────────
+if i_show_manip
+    // Crear caja al detectar la primera barrida
+    if swept_dn and not box_l_done
+        box_dn := box.new(bar_index, acc_lo, bar_index + 1, manip_lo,
+             border_color=i_col_manip_l, bgcolor=i_col_manip_l, border_width=1)
+        box_l_done := true
+
+    if swept_up and not box_s_done
+        box_up := box.new(bar_index, manip_hi, bar_index + 1, acc_hi,
+             border_color=i_col_manip_s, bgcolor=i_col_manip_s, border_width=1)
+        box_s_done := true
+
+    // Extender mientras estamos en KZ
+    if not na(box_dn) and in_kz
+        box.set_right(box_dn, bar_index + 1)
+        box.set_bottom(box_dn, manip_lo)
+
+    if not na(box_up) and in_kz
+        box.set_right(box_up, bar_index + 1)
+        box.set_top(box_up, manip_hi)
+
+// ─────────────────────────────────────────────────────────────────
+// FASE 3 – DETECCIÓN DE PIVOT → NIVEL DE ENTRADA (Buy/Sell Stop)
+// ─────────────────────────────────────────────────────────────────
+// ta.pivothigh devuelve el valor del pivot confirmado (con lag = pivot_rb barras)
+ph = ta.pivothigh(high, i_pivot_lb, i_pivot_rb)
+pl = ta.pivotlow(low,   i_pivot_lb, i_pivot_rb)
+
 flat = strategy.position_size == 0
 
-// Largo: barrida bajista + precio cierra de nuevo por encima de acc_lo
-long_sig = in_kz
-         and swept_dn
-         and close > acc_lo
-         and not na(manip_lo)
-         and bias_bull
-         and flat
-         and not traded_long
+// Actualizar trigger con el pivot más reciente tras la barrida
+// (el precio puede hacer múltiples lower lows → el trigger baja con él)
+if in_kz and flat
+    if swept_dn and not entry_done_l
+        if not na(ph) and ph < acc_hi  // pivot high por debajo del TP → válido
+            trig_l := ph
+            sl_l   := manip_lo - i_sl_buf * tick
 
-// Corto: barrida alcista + precio cierra de nuevo por debajo de acc_hi
-short_sig = in_kz
-          and swept_up
-          and close < acc_hi
-          and not na(manip_hi)
-          and bias_bear
-          and flat
-          and not traded_short
+    if swept_up and not entry_done_s
+        if not na(pl) and pl > acc_lo   // pivot low por encima del TP → válido
+            trig_s := pl
+            sl_s   := manip_hi + i_sl_buf * tick
 
-// ═══════════════════════════════════════════════════════════════════════════
-// EJECUCIÓN
-// SL: más allá del extremo de la manipulación + buffer.
-// TP: calculado con el R/R definido por el usuario.
-// ═══════════════════════════════════════════════════════════════════════════
-if long_sig
-    sl = manip_lo - i_sl_buf * tick
-    tp = close + (close - sl) * i_rr
-    strategy.entry("PO3 L", strategy.long)
-    strategy.exit("PO3 L/X", "PO3 L", stop=sl, limit=tp)
-    traded_long := true
+// ─────────────────────────────────────────────────────────────────
+// ENTRADAS  (Buy Stop / Sell Stop)
+// Se reemiten cada bar para actualizar el nivel si el trigger cambió
+// ─────────────────────────────────────────────────────────────────
+if in_kz and not na(trig_l) and not na(sl_l) and swept_dn and not entry_done_l and flat
+    strategy.entry("PO3 L", strategy.long,  stop=trig_l)
+    strategy.exit ("PO3 L/X", "PO3 L", stop=sl_l, limit=acc_hi)
+    active_tp := acc_hi
 
-if short_sig
-    sl = manip_hi + i_sl_buf * tick
-    tp = close - (sl - close) * i_rr
-    strategy.entry("PO3 S", strategy.short)
-    strategy.exit("PO3 S/X", "PO3 S", stop=sl, limit=tp)
-    traded_short := true
+if in_kz and not na(trig_s) and not na(sl_s) and swept_up and not entry_done_s and flat
+    strategy.entry("PO3 S", strategy.short, stop=trig_s)
+    strategy.exit ("PO3 S/X", "PO3 S", stop=sl_s, limit=acc_lo)
+    active_tp := acc_lo
 
-// ═══════════════════════════════════════════════════════════════════════════
-// CAJAS DE MANIPULACIÓN
-// Zona visual coloreada entre el rango y el extremo de la barrida.
-// ═══════════════════════════════════════════════════════════════════════════
-var box box_dn = na
-var box box_up = na
+// Cancelar órdenes pendientes si la KZ cierra sin entrada
+if kz_cls and flat
+    strategy.cancel("PO3 L")
+    strategy.cancel("PO3 S")
 
-if kz_open
-    box_dn := na
-    box_up := na
+// Registrar entrada cuando el trade se abre
+if strategy.position_size > 0 and flat[1]
+    entry_done_l := true
+    entry_px     := strategy.position_avg_price
 
-// Crear caja en el primer bar de cada barrida
-if swept_dn and not swept_dn[1] and i_show_manip
-    box_dn := box.new(bar_index, acc_lo, bar_index + 1, manip_lo,
-         border_color=i_col_manip_l, bgcolor=i_col_manip_l,
-         border_width=1, extend=extend.none)
+if strategy.position_size < 0 and flat[1]
+    entry_done_s := true
+    entry_px     := strategy.position_avg_price
 
-if swept_up and not swept_up[1] and i_show_manip
-    box_up := box.new(bar_index, manip_hi, bar_index + 1, acc_hi,
-         border_color=i_col_manip_s, bgcolor=i_col_manip_s,
-         border_width=1, extend=extend.none)
+// ─────────────────────────────────────────────────────────────────
+// BREAK EVEN A LAS 11:00 ET
+// "El 11 es el único punto donde yo te permitiría poner break even"
+// ─────────────────────────────────────────────────────────────────
+if be_fire and not flat and not na(entry_px)
+    if strategy.position_size > 0
+        strategy.exit("PO3 L/X", "PO3 L", stop=entry_px, limit=active_tp)
+    if strategy.position_size < 0
+        strategy.exit("PO3 S/X", "PO3 S", stop=entry_px, limit=active_tp)
 
-// Extender caja mientras la KZ está activa
-if not na(box_dn) and in_kz
-    box.set_right(box_dn, bar_index + 1)
-    box.set_bottom(box_dn, manip_lo)
-
-if not na(box_up) and in_kz
-    box.set_right(box_up, bar_index + 1)
-    box.set_top(box_up, manip_hi)
-
-// Cerrar caja al terminar la KZ
-if kz_close
-    if not na(box_dn)
-        box.set_right(box_dn, bar_index)
-    if not na(box_up)
-        box.set_right(box_up, bar_index)
-
-// ═══════════════════════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────
 // PLOTS
-// ═══════════════════════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────
+// Kill Zone background
 bgcolor(i_show_kz and in_kz ? i_col_kz : na, title="Kill Zone BG")
 
-// Niveles del rango de acumulación (solo visibles durante la KZ)
-plot(i_show_range and in_kz and not na(acc_hi) ? acc_hi : na,
-     "Accum High", i_col_range, 1, plot.style_linebr)
-plot(i_show_range and in_kz and not na(acc_lo) ? acc_lo : na,
-     "Accum Low",  i_col_range, 1, plot.style_linebr)
+// Rango de acumulación (vela de las 6) – visible desde la KZ en adelante
+rng_active = in_kz or (not in_kz and not na(acc_hi) and tod < kz_e + 60)
+plot(i_show_range and not na(acc_hi) ? acc_hi : na,
+     "Range Hi (vela 6h)", i_col_range, 1, plot.style_linebr)
+plot(i_show_range and not na(acc_lo) ? acc_lo : na,
+     "Range Lo (vela 6h)", i_col_range, 1, plot.style_linebr)
 
-// Equilibrium (nivel 0.5 del rango – zona de valor justo / PO3 mid)
-eq = not na(acc_lo) ? acc_lo + rng_size * 0.5 : na
-plot(i_show_eq and in_kz ? eq : na,
-     "Equilibrium 0.5", color.new(i_col_range, 55), 1,
-     plot.style_linebr, linewidth=1)
+// Equilibrium 0.5
+eq = not na(acc_lo) and not na(acc_hi) ? acc_lo + (acc_hi - acc_lo) * 0.5 : na
+plot(i_show_eq and not na(eq) ? eq : na,
+     "Equilibrium 0.5", color.new(i_col_range, 60), 1, plot.style_linebr)
 
-// Flechas de entrada
-plotshape(long_sig,  "PO3 Long",  shape.triangleup,   location.belowbar,
-     color.lime, size=size.normal, title="Long Entry")
-plotshape(short_sig, "PO3 Short", shape.triangledown, location.abovebar,
-     color.red,  size=size.normal, title="Short Entry")
+// Trigger (nivel del Buy/Sell Stop)
+plot(i_show_trig and in_kz and not na(trig_l) ? trig_l : na,
+     "Buy Stop trigger",  i_col_trig_l, 1, plot.style_linebr)
+plot(i_show_trig and in_kz and not na(trig_s) ? trig_s : na,
+     "Sell Stop trigger", i_col_trig_s, 1, plot.style_linebr)
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────
 // ALERTAS
-// ═══════════════════════════════════════════════════════════════════════════
-alertcondition(long_sig,  "PO3 Long Entry",
-     "WS·PO3 — Entrada LARGA en {{ticker}} @ {{close}}")
-alertcondition(short_sig, "PO3 Short Entry",
-     "WS·PO3 — Entrada CORTA en {{ticker}} @ {{close}}")
+// ─────────────────────────────────────────────────────────────────
+alertcondition(swept_dn and in_kz and not swept_dn[1],
+     "PO3 – Barrida bajista",
+     "WS·PO3 {{ticker}}: Manipulación bajista detectada. Esperando pivot para Buy Stop")
 
-// ═══════════════════════════════════════════════════════════════════════════
-// TABLA DE ESTADO (esquina superior derecha)
-// ═══════════════════════════════════════════════════════════════════════════
-var table tbl = table.new(position.top_right, 2, 8,
-     bgcolor       = color.new(color.black, 72),
-     border_color  = color.new(color.gray,  50),
-     border_width  = 1,
-     frame_color   = color.new(color.gray,  40),
-     frame_width   = 1)
+alertcondition(swept_up and in_kz and not swept_up[1],
+     "PO3 – Barrida alcista",
+     "WS·PO3 {{ticker}}: Manipulación alcista detectada. Esperando pivot para Sell Stop")
+
+alertcondition(not na(trig_l) and na(trig_l[1]) and in_kz,
+     "PO3 – Buy Stop activado",
+     "WS·PO3 {{ticker}}: Buy Stop colocado en " + str.tostring(trig_l, "#.##"))
+
+alertcondition(not na(trig_s) and na(trig_s[1]) and in_kz,
+     "PO3 – Sell Stop activado",
+     "WS·PO3 {{ticker}}: Sell Stop colocado en " + str.tostring(trig_s, "#.##"))
+
+// ─────────────────────────────────────────────────────────────────
+// STATUS TABLE
+// ─────────────────────────────────────────────────────────────────
+var table tbl = table.new(position.top_right, 2, 10,
+     bgcolor      = color.new(color.black, 72),
+     border_color = color.new(color.gray,  50),
+     border_width = 1,
+     frame_color  = color.new(color.gray,  40),
+     frame_width  = 1)
 
 if barstate.islast and i_show_table
     // Fase PO3
-    phase_str = not in_kz              ? "⏸  Waiting"         :
-         not swept_dn and not swept_up  ? "1 · Accumulation"  :
-         not traded_long and not traded_short ? "2 · Manipulation" :
-         "3 · Distribution"
-    phase_col = not in_kz              ? color.gray  :
-         not swept_dn and not swept_up  ? color.yellow :
-         not traded_long and not traded_short ? color.aqua  :
-         color.lime
+    phase_str = not in_kz and not (entry_done_l or entry_done_s) ? "⏸  Waiting" :
+         not swept_dn and not swept_up                           ? "1 · Acumulación" :
+         (swept_dn or swept_up) and na(trig_l) and na(trig_s)    ? "2 · Manipulación" :
+         not entry_done_l and not entry_done_s                   ? "2 · Buy/Sell Stop set" :
+         "3 · En trade"
+    phase_col = not in_kz and not (entry_done_l or entry_done_s) ? color.gray  :
+         not swept_dn and not swept_up                           ? color.yellow :
+         (swept_dn or swept_up) and na(trig_l) and na(trig_s)    ? color.aqua  :
+         not entry_done_l and not entry_done_s                   ? color.lime  :
+         color.green
 
-    htf_str = htf_close > htf_ema ? "▲  BULLISH" : "▼  BEARISH"
-    htf_col = htf_close > htf_ema ? color.lime    : color.red
+    // R:R estimado
+    rr_str = ""
+    if not na(trig_l) and not na(sl_l) and not na(acc_hi) and trig_l > sl_l
+        rr_val = (acc_hi - trig_l) / (trig_l - sl_l)
+        rr_str := str.tostring(rr_val, "#.##") + " : 1"
+    else if not na(trig_s) and not na(sl_s) and not na(acc_lo) and sl_s > trig_s
+        rr_val = (trig_s - acc_lo) / (sl_s - trig_s)
+        rr_str := str.tostring(rr_val, "#.##") + " : 1"
+    else
+        rr_str := "—"
 
-    kz_str  = in_kz ? "● ACTIVE" : "○ Closed"
-    kz_col  = in_kz ? color.lime : color.gray
-
-    pos_str = strategy.position_size > 0 ? "▲ Long  " + str.tostring(strategy.position_size) :
-              strategy.position_size < 0 ? "▼ Short " + str.tostring(math.abs(strategy.position_size)) :
-              "—"
+    pos_str = strategy.position_size > 0 ? "▲ Long  " + str.tostring(strategy.position_size)  :
+              strategy.position_size < 0 ? "▼ Short " + str.tostring(math.abs(strategy.position_size)) : "—"
     pos_col = strategy.position_size > 0 ? color.lime :
               strategy.position_size < 0 ? color.red  : color.gray
 
-    S = size.small
-    C = color.new(color.black, 72)
+    be_str  = str.tostring(i_be_h) + ":" + (i_be_m < 10 ? "0" : "") + str.tostring(i_be_m) + " ET"
 
-    table.cell(tbl, 0, 0, "WS · PO3",        text_color=color.white,  bgcolor=color.new(color.blue, 55), text_size=S)
-    table.cell(tbl, 1, 0, syminfo.ticker,     text_color=color.yellow, bgcolor=color.new(color.blue, 55), text_size=S)
-    table.cell(tbl, 0, 1, "HTF Bias",         text_color=color.gray,   bgcolor=C,                         text_size=S)
-    table.cell(tbl, 1, 1, htf_str,            text_color=htf_col,      bgcolor=C,                         text_size=S)
-    table.cell(tbl, 0, 2, "Kill Zone",        text_color=color.gray,   bgcolor=C,                         text_size=S)
-    table.cell(tbl, 1, 2, kz_str,             text_color=kz_col,       bgcolor=C,                         text_size=S)
-    table.cell(tbl, 0, 3, "PO3 Phase",        text_color=color.gray,   bgcolor=C,                         text_size=S)
-    table.cell(tbl, 1, 3, phase_str,          text_color=phase_col,    bgcolor=C,                         text_size=S)
-    table.cell(tbl, 0, 4, "Accum Hi",         text_color=color.gray,   bgcolor=C,                         text_size=S)
-    table.cell(tbl, 1, 4, not na(acc_hi) ? str.tostring(acc_hi, "#.##") : "—",
-                                               text_color=color.white,  bgcolor=C,                         text_size=S)
-    table.cell(tbl, 0, 5, "Accum Lo",         text_color=color.gray,   bgcolor=C,                         text_size=S)
-    table.cell(tbl, 1, 5, not na(acc_lo) ? str.tostring(acc_lo, "#.##") : "—",
-                                               text_color=color.white,  bgcolor=C,                         text_size=S)
-    table.cell(tbl, 0, 6, "Position",         text_color=color.gray,   bgcolor=C,                         text_size=S)
-    table.cell(tbl, 1, 6, pos_str,            text_color=pos_col,      bgcolor=C,                         text_size=S)
-    table.cell(tbl, 0, 7, "R:R",              text_color=color.gray,   bgcolor=C,                         text_size=S)
-    table.cell(tbl, 1, 7, str.tostring(i_rr, "#.##") + " : 1",
-                                               text_color=color.white,  bgcolor=C,                         text_size=S)
+    S  = size.small
+    BG = color.new(color.black, 72)
+    HDR= color.new(color.blue,  55)
+
+    table.cell(tbl, 0,  0, "WS · PO3",    text_color=color.white,  bgcolor=HDR, text_size=S)
+    table.cell(tbl, 1,  0, syminfo.ticker, text_color=color.yellow, bgcolor=HDR, text_size=S)
+    table.cell(tbl, 0,  1, "Kill Zone",    text_color=color.gray,   bgcolor=BG,  text_size=S)
+    table.cell(tbl, 1,  1, in_kz ? "● ACTIVE" : "○ Closed",
+         text_color=in_kz ? color.lime : color.gray, bgcolor=BG, text_size=S)
+    table.cell(tbl, 0,  2, "PO3 Phase",   text_color=color.gray,   bgcolor=BG,  text_size=S)
+    table.cell(tbl, 1,  2, phase_str,      text_color=phase_col,    bgcolor=BG,  text_size=S)
+    table.cell(tbl, 0,  3, "Range Hi (6h)", text_color=color.gray,  bgcolor=BG,  text_size=S)
+    table.cell(tbl, 1,  3, not na(acc_hi) ? str.tostring(acc_hi, "#.##") : "—",
+         text_color=color.white, bgcolor=BG, text_size=S)
+    table.cell(tbl, 0,  4, "Range Lo (6h)", text_color=color.gray,  bgcolor=BG,  text_size=S)
+    table.cell(tbl, 1,  4, not na(acc_lo) ? str.tostring(acc_lo, "#.##") : "—",
+         text_color=color.white, bgcolor=BG, text_size=S)
+    table.cell(tbl, 0,  5, "Trigger",      text_color=color.gray,   bgcolor=BG,  text_size=S)
+    table.cell(tbl, 1,  5, not na(trig_l) ? "▲ " + str.tostring(trig_l, "#.##") :
+                            not na(trig_s) ? "▼ " + str.tostring(trig_s, "#.##") : "—",
+         text_color=color.white, bgcolor=BG, text_size=S)
+    table.cell(tbl, 0,  6, "R:R estimado", text_color=color.gray,   bgcolor=BG,  text_size=S)
+    table.cell(tbl, 1,  6, rr_str,         text_color=color.white,  bgcolor=BG,  text_size=S)
+    table.cell(tbl, 0,  7, "Posición",     text_color=color.gray,   bgcolor=BG,  text_size=S)
+    table.cell(tbl, 1,  7, pos_str,        text_color=pos_col,      bgcolor=BG,  text_size=S)
+    table.cell(tbl, 0,  8, "Break Even",   text_color=color.gray,   bgcolor=BG,  text_size=S)
+    table.cell(tbl, 1,  8, be_str,         text_color=color.gray,   bgcolor=BG,  text_size=S)
+    table.cell(tbl, 0,  9, "Modelo",       text_color=color.gray,   bgcolor=BG,  text_size=S)
+    table.cell(tbl, 1,  9, swept_dn and kz_open ? "Continuación L" :
+                            swept_up and kz_open ? "Continuación S" : "Normal",
+         text_color=color.white, bgcolor=BG, text_size=S)
