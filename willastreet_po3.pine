@@ -1,0 +1,311 @@
+//@version=5
+strategy("Willastreet PO3 [MNQ]",
+     shorttitle         = "WS·PO3",
+     overlay            = true,
+     default_qty_type   = strategy.fixed,
+     default_qty_value  = 1,
+     commission_type    = strategy.commission.cash_per_contract,
+     commission_value   = 0.50,
+     slippage           = 2,
+     calc_on_every_tick = false)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════
+GRP_KZ   = "Kill Zone  (NY default: 9:30 – 11:00 ET)"
+GRP_PO3  = "PO3 Detection"
+GRP_RISK = "Risk Management"
+GRP_HTF  = "HTF Trend Filter  (3H recomendado)"
+GRP_VIS  = "Visuals"
+
+// ── Kill Zone ──────────────────────────────────────────────────────────────
+i_kz_h1       = input.int(9,    "Start Hour  (ET)",              minval=0, maxval=23, group=GRP_KZ)
+i_kz_m1       = input.int(30,   "Start Minute",                  minval=0, maxval=59, group=GRP_KZ)
+i_kz_h2       = input.int(11,   "End Hour    (ET)",              minval=0, maxval=23, group=GRP_KZ)
+i_kz_m2       = input.int(0,    "End Minute",                    minval=0, maxval=59, group=GRP_KZ)
+
+// ── PO3 Detection ─────────────────────────────────────────────────────────
+i_acc_bars    = input.int(30,   "Accum Lookback (bars)",
+     minval=5, maxval=500, group=GRP_PO3,
+     tooltip="Barras previas al inicio de la Kill Zone usadas para definir el rango de acumulación. En 5M → 30 barras ≈ 2h30m.")
+i_sweep_ticks = input.int(4,    "Min Sweep beyond range (ticks)",
+     minval=1, maxval=200, group=GRP_PO3,
+     tooltip="Ticks mínimos que el precio debe superar el rango para que la barrera/manipulación sea válida.")
+
+// ── Risk Management ───────────────────────────────────────────────────────
+i_rr          = input.float(2.0, "Risk/Reward Ratio",
+     minval=1.0, maxval=10.0, step=0.25, group=GRP_RISK)
+i_sl_buf      = input.int(4,    "SL Buffer (ticks)",
+     minval=0, maxval=50, group=GRP_RISK,
+     tooltip="Ticks adicionales más allá del extremo de la manipulación para colocar el Stop Loss.")
+
+// ── HTF Filter ────────────────────────────────────────────────────────────
+i_use_htf     = input.bool(true,  "Enable HTF Filter",           group=GRP_HTF)
+i_htf_tf      = input.timeframe("180", "HTF Timeframe",          group=GRP_HTF)
+i_htf_ema_len = input.int(20,    "HTF EMA Length",               group=GRP_HTF)
+
+// ── Visuals ───────────────────────────────────────────────────────────────
+i_show_kz     = input.bool(true, "Show Kill Zone BG",            group=GRP_VIS)
+i_show_range  = input.bool(true, "Show Accumulation Range",      group=GRP_VIS)
+i_show_eq     = input.bool(true, "Show Equilibrium (0.5)",       group=GRP_VIS)
+i_show_manip  = input.bool(true, "Show Manipulation Zone",       group=GRP_VIS)
+i_show_table  = input.bool(true, "Show Status Table",            group=GRP_VIS)
+i_col_kz      = input.color(color.new(color.blue,   88), "Kill Zone BG",       group=GRP_VIS)
+i_col_range   = input.color(color.red,                   "Range Lines",        group=GRP_VIS)
+i_col_manip_l = input.color(color.new(color.teal,   70), "Manip Zone (Long)",  group=GRP_VIS)
+i_col_manip_s = input.color(color.new(color.orange, 70), "Manip Zone (Short)", group=GRP_VIS)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SESSION HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+TZ       = "America/New_York"
+tod_min  = hour(time, TZ) * 60 + minute(time, TZ)
+kz_start = i_kz_h1 * 60 + i_kz_m1
+kz_end   = i_kz_h2 * 60 + i_kz_m2
+
+in_kz    = tod_min >= kz_start and tod_min < kz_end
+kz_open  = in_kz and not in_kz[1]    // primer bar de la KZ
+kz_close = not in_kz and in_kz[1]    // primer bar tras el cierre de la KZ
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HTF TREND  (3H por defecto)
+// Sesgo alcista si el precio cierra por encima de su EMA en HTF.
+// ═══════════════════════════════════════════════════════════════════════════
+[htf_close, htf_ema] = request.security(
+     syminfo.tickerid, i_htf_tf,
+     [close, ta.ema(close, i_htf_ema_len)],
+     lookahead = barmerge.lookahead_off)
+
+bias_bull = not i_use_htf or htf_close > htf_ema
+bias_bear = not i_use_htf or htf_close < htf_ema
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FASE 1 – ACUMULACIÓN
+// Al abrir la Kill Zone se hace un snapshot del rango de las últimas
+// i_acc_bars velas (captura el rango pre-mercado / sesión asiática/Londres).
+// ═══════════════════════════════════════════════════════════════════════════
+var float acc_hi = na
+var float acc_lo = na
+
+if kz_open
+    acc_hi := ta.highest(high, i_acc_bars)
+    acc_lo  := ta.lowest(low,  i_acc_bars)
+
+rng_size   = nz(acc_hi - acc_lo)
+tick       = syminfo.mintick
+sweep_dist = i_sweep_ticks * tick
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FASE 2 – MANIPULACIÓN (Stop Hunt)
+// Se activa cuando el precio supera el rango por sweep_dist.
+//   • swept_dn → barrida por abajo (stop hunt de largos → posible entrada larga)
+//   • swept_up → barrida por arriba (stop hunt de cortos → posible entrada corta)
+// ═══════════════════════════════════════════════════════════════════════════
+var bool  swept_dn = false
+var bool  swept_up = false
+var float manip_lo = na     // extremo más bajo de la barrida (referencia para SL largo)
+var float manip_hi = na     // extremo más alto de la barrida (referencia para SL corto)
+var int   dn_bi    = na     // bar_index del inicio de la barrida bajista
+var int   up_bi    = na     // bar_index del inicio de la barrida alcista
+
+// Una operación por dirección por sesión de KZ
+var bool traded_long  = false
+var bool traded_short = false
+
+if kz_open
+    swept_dn      := false
+    swept_up      := false
+    manip_lo      := na
+    manip_hi      := na
+    dn_bi         := na
+    up_bi         := na
+    traded_long   := false
+    traded_short  := false
+
+if in_kz and not na(acc_lo) and not na(acc_hi) and rng_size > 0
+    // Barrida bajista: precio perfora por debajo de acc_lo
+    if low < acc_lo - sweep_dist
+        if not swept_dn
+            swept_dn := true
+            dn_bi    := bar_index
+            manip_lo := low
+        else
+            manip_lo := math.min(manip_lo, low)
+
+    // Barrida alcista: precio perfora por encima de acc_hi
+    if high > acc_hi + sweep_dist
+        if not swept_up
+            swept_up := true
+            up_bi    := bar_index
+            manip_hi := high
+        else
+            manip_hi := math.max(manip_hi, high)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FASE 3 – DISTRIBUCIÓN (Señal de entrada)
+// Después de la barrida, el precio recupera el rango → entrada en la dirección
+// del Smart Money (contraria a la barrida).
+// ═══════════════════════════════════════════════════════════════════════════
+flat = strategy.position_size == 0
+
+// Largo: barrida bajista + precio cierra de nuevo por encima de acc_lo
+long_sig = in_kz
+         and swept_dn
+         and close > acc_lo
+         and not na(manip_lo)
+         and bias_bull
+         and flat
+         and not traded_long
+
+// Corto: barrida alcista + precio cierra de nuevo por debajo de acc_hi
+short_sig = in_kz
+          and swept_up
+          and close < acc_hi
+          and not na(manip_hi)
+          and bias_bear
+          and flat
+          and not traded_short
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EJECUCIÓN
+// SL: más allá del extremo de la manipulación + buffer.
+// TP: calculado con el R/R definido por el usuario.
+// ═══════════════════════════════════════════════════════════════════════════
+if long_sig
+    sl = manip_lo - i_sl_buf * tick
+    tp = close + (close - sl) * i_rr
+    strategy.entry("PO3 L", strategy.long)
+    strategy.exit("PO3 L/X", "PO3 L", stop=sl, limit=tp)
+    traded_long := true
+
+if short_sig
+    sl = manip_hi + i_sl_buf * tick
+    tp = close - (sl - close) * i_rr
+    strategy.entry("PO3 S", strategy.short)
+    strategy.exit("PO3 S/X", "PO3 S", stop=sl, limit=tp)
+    traded_short := true
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CAJAS DE MANIPULACIÓN
+// Zona visual coloreada entre el rango y el extremo de la barrida.
+// ═══════════════════════════════════════════════════════════════════════════
+var box box_dn = na
+var box box_up = na
+
+if kz_open
+    box_dn := na
+    box_up := na
+
+// Crear caja en el primer bar de cada barrida
+if swept_dn and not swept_dn[1] and i_show_manip
+    box_dn := box.new(bar_index, acc_lo, bar_index + 1, manip_lo,
+         border_color=i_col_manip_l, bgcolor=i_col_manip_l,
+         border_width=1, extend=extend.none)
+
+if swept_up and not swept_up[1] and i_show_manip
+    box_up := box.new(bar_index, manip_hi, bar_index + 1, acc_hi,
+         border_color=i_col_manip_s, bgcolor=i_col_manip_s,
+         border_width=1, extend=extend.none)
+
+// Extender caja mientras la KZ está activa
+if not na(box_dn) and in_kz
+    box.set_right(box_dn, bar_index + 1)
+    box.set_bottom(box_dn, manip_lo)
+
+if not na(box_up) and in_kz
+    box.set_right(box_up, bar_index + 1)
+    box.set_top(box_up, manip_hi)
+
+// Cerrar caja al terminar la KZ
+if kz_close
+    if not na(box_dn)
+        box.set_right(box_dn, bar_index)
+    if not na(box_up)
+        box.set_right(box_up, bar_index)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PLOTS
+// ═══════════════════════════════════════════════════════════════════════════
+bgcolor(i_show_kz and in_kz ? i_col_kz : na, title="Kill Zone BG")
+
+// Niveles del rango de acumulación (solo visibles durante la KZ)
+plot(i_show_range and in_kz and not na(acc_hi) ? acc_hi : na,
+     "Accum High", i_col_range, 1, plot.style_linebr)
+plot(i_show_range and in_kz and not na(acc_lo) ? acc_lo : na,
+     "Accum Low",  i_col_range, 1, plot.style_linebr)
+
+// Equilibrium (nivel 0.5 del rango – zona de valor justo / PO3 mid)
+eq = not na(acc_lo) ? acc_lo + rng_size * 0.5 : na
+plot(i_show_eq and in_kz ? eq : na,
+     "Equilibrium 0.5", color.new(i_col_range, 55), 1,
+     plot.style_linebr, linewidth=1)
+
+// Flechas de entrada
+plotshape(long_sig,  "PO3 Long",  shape.triangleup,   location.belowbar,
+     color.lime, size=size.normal, title="Long Entry")
+plotshape(short_sig, "PO3 Short", shape.triangledown, location.abovebar,
+     color.red,  size=size.normal, title="Short Entry")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ALERTAS
+// ═══════════════════════════════════════════════════════════════════════════
+alertcondition(long_sig,  "PO3 Long Entry",
+     "WS·PO3 — Entrada LARGA en {{ticker}} @ {{close}}")
+alertcondition(short_sig, "PO3 Short Entry",
+     "WS·PO3 — Entrada CORTA en {{ticker}} @ {{close}}")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TABLA DE ESTADO (esquina superior derecha)
+// ═══════════════════════════════════════════════════════════════════════════
+var table tbl = table.new(position.top_right, 2, 8,
+     bgcolor       = color.new(color.black, 72),
+     border_color  = color.new(color.gray,  50),
+     border_width  = 1,
+     frame_color   = color.new(color.gray,  40),
+     frame_width   = 1)
+
+if barstate.islast and i_show_table
+    // Fase PO3
+    phase_str = not in_kz              ? "⏸  Waiting"         :
+         not swept_dn and not swept_up  ? "1 · Accumulation"  :
+         not traded_long and not traded_short ? "2 · Manipulation" :
+         "3 · Distribution"
+    phase_col = not in_kz              ? color.gray  :
+         not swept_dn and not swept_up  ? color.yellow :
+         not traded_long and not traded_short ? color.aqua  :
+         color.lime
+
+    htf_str = htf_close > htf_ema ? "▲  BULLISH" : "▼  BEARISH"
+    htf_col = htf_close > htf_ema ? color.lime    : color.red
+
+    kz_str  = in_kz ? "● ACTIVE" : "○ Closed"
+    kz_col  = in_kz ? color.lime : color.gray
+
+    pos_str = strategy.position_size > 0 ? "▲ Long  " + str.tostring(strategy.position_size) :
+              strategy.position_size < 0 ? "▼ Short " + str.tostring(math.abs(strategy.position_size)) :
+              "—"
+    pos_col = strategy.position_size > 0 ? color.lime :
+              strategy.position_size < 0 ? color.red  : color.gray
+
+    S = size.small
+    C = color.new(color.black, 72)
+
+    table.cell(tbl, 0, 0, "WS · PO3",        text_color=color.white,  bgcolor=color.new(color.blue, 55), text_size=S)
+    table.cell(tbl, 1, 0, syminfo.ticker,     text_color=color.yellow, bgcolor=color.new(color.blue, 55), text_size=S)
+    table.cell(tbl, 0, 1, "HTF Bias",         text_color=color.gray,   bgcolor=C,                         text_size=S)
+    table.cell(tbl, 1, 1, htf_str,            text_color=htf_col,      bgcolor=C,                         text_size=S)
+    table.cell(tbl, 0, 2, "Kill Zone",        text_color=color.gray,   bgcolor=C,                         text_size=S)
+    table.cell(tbl, 1, 2, kz_str,             text_color=kz_col,       bgcolor=C,                         text_size=S)
+    table.cell(tbl, 0, 3, "PO3 Phase",        text_color=color.gray,   bgcolor=C,                         text_size=S)
+    table.cell(tbl, 1, 3, phase_str,          text_color=phase_col,    bgcolor=C,                         text_size=S)
+    table.cell(tbl, 0, 4, "Accum Hi",         text_color=color.gray,   bgcolor=C,                         text_size=S)
+    table.cell(tbl, 1, 4, not na(acc_hi) ? str.tostring(acc_hi, "#.##") : "—",
+                                               text_color=color.white,  bgcolor=C,                         text_size=S)
+    table.cell(tbl, 0, 5, "Accum Lo",         text_color=color.gray,   bgcolor=C,                         text_size=S)
+    table.cell(tbl, 1, 5, not na(acc_lo) ? str.tostring(acc_lo, "#.##") : "—",
+                                               text_color=color.white,  bgcolor=C,                         text_size=S)
+    table.cell(tbl, 0, 6, "Position",         text_color=color.gray,   bgcolor=C,                         text_size=S)
+    table.cell(tbl, 1, 6, pos_str,            text_color=pos_col,      bgcolor=C,                         text_size=S)
+    table.cell(tbl, 0, 7, "R:R",              text_color=color.gray,   bgcolor=C,                         text_size=S)
+    table.cell(tbl, 1, 7, str.tostring(i_rr, "#.##") + " : 1",
+                                               text_color=color.white,  bgcolor=C,                         text_size=S)
