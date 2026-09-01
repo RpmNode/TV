@@ -17,7 +17,9 @@ strategy("BTC/USDC - PO3 MTF + Liquidity + Structure v3.0",
 riskPercent        = input.float(1.0, "Riesgo por operación (%)", step=0.1, minval=0.1)
 tp1RR              = input.float(2.0, "TP1 RR", step=0.25, minval=0.5)
 tp1Percent         = input.float(50.0, "Cerrar en TP1 (%)", step=5, minval=0, maxval=100)
+minRiskATR         = input.float(0.15, "Riesgo mínimo permitido (x ATR)", step=0.05, minval=0.01)
 maxRiskATR         = input.float(3.0, "Riesgo máximo permitido (x ATR)", step=0.5, minval=0.5)
+maxLeverage        = input.float(3.0, "Apalancamiento máximo (x equity)", step=0.5, minval=0.5)
 requireMinRunnerRR = input.bool(true, "Exigir RR estructural mínimo para el runner")
 minRunnerRR        = input.float(2.0, "RR mínimo del objetivo estructural", step=0.25, minval=0.5)
 
@@ -266,14 +268,26 @@ shortStructTargetRaw = h4Low
 longStructRR  = longRiskRaw  > 0 ? (longStructTargetRaw - close)  / longRiskRaw  : 0.0
 shortStructRR = shortRiskRaw > 0 ? (close - shortStructTargetRaw) / shortRiskRaw : 0.0
 
-validLongRisk  = longRiskRaw  > syminfo.mintick and longRiskRaw  <= atr * maxRiskATR
-validShortRisk = shortRiskRaw > syminfo.mintick and shortRiskRaw <= atr * maxRiskATR
+// El RR mínimo exigido nunca puede ser menor que tp1RR: si lo fuera,
+// el objetivo estructural del runner podría quedar más cerca que el
+// propio TP1, y el runner cerraría antes de alcanzarlo.
+effectiveMinRunnerRR = math.max(minRunnerRR, tp1RR)
 
-validLongRR  = not requireMinRunnerRR or longStructRR  >= minRunnerRR
-validShortRR = not requireMinRunnerRR or shortStructRR >= minRunnerRR
+minRiskDistance = atr * minRiskATR
 
-qtyLong  = validLongRisk  ? riskMoney / longRiskRaw  : 0.0
-qtyShort = validShortRisk ? riskMoney / shortRiskRaw : 0.0
+validLongRisk  = longRiskRaw  > math.max(syminfo.mintick, minRiskDistance) and longRiskRaw  <= atr * maxRiskATR
+validShortRisk = shortRiskRaw > math.max(syminfo.mintick, minRiskDistance) and shortRiskRaw <= atr * maxRiskATR
+
+validLongRR  = not requireMinRunnerRR or longStructRR  >= effectiveMinRunnerRR
+validShortRR = not requireMinRunnerRR or shortStructRR >= effectiveMinRunnerRR
+
+// Tope de tamaño por apalancamiento: evita posiciones desmedidas
+// cuando la distancia de riesgo es muy pequeña frente al riesgo % pedido.
+qtyLongMaxByLeverage  = (capital * maxLeverage) / close
+qtyShortMaxByLeverage = (capital * maxLeverage) / close
+
+qtyLong  = validLongRisk  ? math.min(riskMoney / longRiskRaw,  qtyLongMaxByLeverage)  : 0.0
+qtyShort = validShortRisk ? math.min(riskMoney / shortRiskRaw, qtyShortMaxByLeverage) : 0.0
 
 longEntryOK  = longSignal  and qtyLong  > 0 and validLongRR
 shortEntryOK = shortSignal and qtyShort > 0 and validShortRR
@@ -378,14 +392,18 @@ if strategy.position_size < 0
 
 //====================================================
 // GESTIÓN ESTRUCTURAL DEL RUNNER
-// Si aparece ruptura estructural contraria, cerramos el runner.
+// Si aparece ruptura estructural contraria, cerramos toda la
+// posición restante. OJO: a diferencia de strategy.exit(), el
+// qty_percent de strategy.close() es un % de la posición ABIERTA
+// actual, no de la cantidad de entrada — usar 100-tp1Percent aquí
+// (como en v2) deja huérfano un 25% de la posición tras el TP1.
 //====================================================
 
 if strategy.position_size > 0 and mssDown
-    strategy.close("PO3 Long", qty_percent=100 - tp1Percent, comment="5m Structure Exit")
+    strategy.close("PO3 Long", qty_percent=100, comment="5m Structure Exit")
 
 if strategy.position_size < 0 and mssUp
-    strategy.close("PO3 Short", qty_percent=100 - tp1Percent, comment="5m Structure Exit")
+    strategy.close("PO3 Short", qty_percent=100, comment="5m Structure Exit")
 
 
 //====================================================
