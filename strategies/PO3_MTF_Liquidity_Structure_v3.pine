@@ -1,0 +1,443 @@
+//@version=5
+strategy("BTC/USDC - PO3 MTF + Liquidity + Structure v3.0",
+     overlay=true,
+     initial_capital=100000,
+     pyramiding=0,
+     default_qty_type=strategy.fixed,
+     commission_type=strategy.commission.percent,
+     commission_value=0.04,
+     calc_on_order_fills=true,
+     calc_on_every_tick=false)
+
+//====================================================
+// INPUTS
+//====================================================
+
+// --- Riesgo
+riskPercent        = input.float(1.0, "Riesgo por operación (%)", step=0.1, minval=0.1)
+tp1RR              = input.float(2.0, "TP1 RR", step=0.25, minval=0.5)
+tp1Percent         = input.float(50.0, "Cerrar en TP1 (%)", step=5, minval=0, maxval=100)
+minRiskATR         = input.float(0.15, "Riesgo mínimo permitido (x ATR)", step=0.05, minval=0.01)
+maxRiskATR         = input.float(3.0, "Riesgo máximo permitido (x ATR)", step=0.5, minval=0.5)
+maxLeverage        = input.float(3.0, "Apalancamiento máximo (x equity)", step=0.5, minval=0.5)
+requireMinRunnerRR = input.bool(true, "Exigir RR estructural mínimo para el runner")
+minRunnerRR        = input.float(2.0, "RR mínimo del objetivo estructural", step=0.25, minval=0.5)
+
+// --- PO3
+sweepBufferATR     = input.float(0.05, "Buffer Sweep ATR", step=0.01)
+requireDailyBias   = input.bool(true, "Exigir BIAS Daily")
+require4HRejection = input.bool(true, "Exigir rechazo del Sweep 4H")
+requireWeeklyAlign = input.bool(false, "Exigir alineación Weekly")
+invalidateATR      = input.float(0.30, "Invalidar setup si excede (x ATR)", step=0.05, minval=0.05)
+maxConfirmBars     = input.int(36, "Máx. velas 5m para confirmar estructura", minval=1)
+
+// --- Estructura
+structureLength = input.int(3, "Estructura 5m", minval=2, maxval=10)
+minBreakATR     = input.float(0.0, "Ruptura mínima de estructura (x ATR)", step=0.05, minval=0)
+
+// --- Gestión del runner
+useBreakeven   = input.bool(true, "Mover runner a breakeven tras TP1")
+useStructTrail = input.bool(false, "Trailing estructural del runner tras breakeven")
+
+// --- Confluencia
+confluenceATR = input.float(0.25, "Distancia para confluencia (ATR)", step=0.05)
+minConfluence = input.int(1, "Confluencias mínimas", minval=0, maxval=3)
+
+// --- Filtro de sesión
+useSessionFilter = input.bool(false, "Filtrar por sesión (Kill Zone)")
+killZoneSession  = input.session("0700-1030", "Sesión operativa (hora del gráfico)")
+
+// --- Control de riesgo diario
+maxTradesPerDay   = input.int(0, "Máx. operaciones por día (0 = sin límite)", minval=0)
+dailyLossLimitPct = input.float(0.0, "Límite de pérdida diaria % (0 = sin límite)", step=0.5, minval=0)
+
+// --- Visual
+showMonthly = input.bool(true, "Mostrar Monthly")
+showWeekly  = input.bool(true, "Mostrar Weekly")
+showDaily   = input.bool(true, "Mostrar Daily")
+show4H      = input.bool(true, "Mostrar 4H")
+showSignals = input.bool(true, "Mostrar señales")
+showArmed   = input.bool(true, "Mostrar setup armado (esperando estructura)")
+
+
+//====================================================
+// ATR
+//====================================================
+
+atr = ta.atr(14)
+
+
+//====================================================
+// NIVELES MULTI-TIMEFRAME
+//====================================================
+
+mHigh  = request.security(syminfo.tickerid, "M", high[1],  lookahead=barmerge.lookahead_off)
+mLow   = request.security(syminfo.tickerid, "M", low[1],   lookahead=barmerge.lookahead_off)
+
+wHigh  = request.security(syminfo.tickerid, "W", high[1],  lookahead=barmerge.lookahead_off)
+wLow   = request.security(syminfo.tickerid, "W", low[1],   lookahead=barmerge.lookahead_off)
+wOpen  = request.security(syminfo.tickerid, "W", open[1],  lookahead=barmerge.lookahead_off)
+wClose = request.security(syminfo.tickerid, "W", close[1], lookahead=barmerge.lookahead_off)
+
+dHigh  = request.security(syminfo.tickerid, "D", high[1],  lookahead=barmerge.lookahead_off)
+dLow   = request.security(syminfo.tickerid, "D", low[1],   lookahead=barmerge.lookahead_off)
+dOpen  = request.security(syminfo.tickerid, "D", open[1],  lookahead=barmerge.lookahead_off)
+dClose = request.security(syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_off)
+
+h4High  = request.security(syminfo.tickerid, "240", high[1],  lookahead=barmerge.lookahead_off)
+h4Low   = request.security(syminfo.tickerid, "240", low[1],   lookahead=barmerge.lookahead_off)
+h4Open  = request.security(syminfo.tickerid, "240", open[1],  lookahead=barmerge.lookahead_off)
+h4Close = request.security(syminfo.tickerid, "240", close[1], lookahead=barmerge.lookahead_off)
+
+
+//====================================================
+// BIAS DAILY / WEEKLY
+//====================================================
+
+dailyBull  = dClose > dOpen
+dailyBear  = dClose < dOpen
+weeklyBull = wClose > wOpen
+weeklyBear = wClose < wOpen
+
+
+//====================================================
+// 4H RANGE
+//====================================================
+
+h4Range = h4High - h4Low
+h4Mid   = h4Low + h4Range * 0.50
+
+// Nuevo rango 4H detectado -> cualquier setup armado sobre el rango
+// anterior queda obsoleto.
+newH4Range = h4High != h4High[1] or h4Low != h4Low[1]
+
+
+//====================================================
+// SWEEP 4H
+//====================================================
+
+sweepHigh = high > h4High + atr * sweepBufferATR
+sweepLow  = low  < h4Low  - atr * sweepBufferATR
+
+
+//====================================================
+// CONFLUENCIA MTF
+// (se compara la mecha del sweep contra los extremos HTF,
+// misma base para largos y cortos)
+//====================================================
+
+nearLevel(price, level) =>
+    math.abs(price - level) <= atr * confluenceATR
+
+shortConfluence =
+     (nearLevel(high, wHigh) ? 1 : 0) +
+     (nearLevel(high, mHigh) ? 1 : 0) +
+     (nearLevel(high, dHigh) ? 1 : 0)
+
+longConfluence =
+     (nearLevel(low, wLow) ? 1 : 0) +
+     (nearLevel(low, mLow) ? 1 : 0) +
+     (nearLevel(low, dLow) ? 1 : 0)
+
+
+//====================================================
+// PO3 VALIDATION
+// require4HRejection ahora sí controla si exigimos el
+// cierre de vuelta dentro del rango (turtle soup) o si
+// basta el barrido para armar el setup.
+//====================================================
+
+po3Short =
+     sweepHigh and
+     (not require4HRejection or close < h4High) and
+     (not requireDailyBias or dailyBear) and
+     (not requireWeeklyAlign or weeklyBear) and
+     shortConfluence >= minConfluence
+
+po3Long =
+     sweepLow and
+     (not require4HRejection or close > h4Low) and
+     (not requireDailyBias or dailyBull) and
+     (not requireWeeklyAlign or weeklyBull) and
+     longConfluence >= minConfluence
+
+
+//====================================================
+// ESTRUCTURA 5M
+//====================================================
+
+previousLow  = ta.lowest(low[1], structureLength)
+previousHigh = ta.highest(high[1], structureLength)
+
+mssDown = close < previousLow  - atr * minBreakATR
+mssUp   = close > previousHigh + atr * minBreakATR
+
+
+//====================================================
+// FILTRO DE SESIÓN
+//====================================================
+
+inKillZone = not useSessionFilter or not na(time(timeframe.period, killZoneSession))
+
+
+//====================================================
+// CONTROL DE RIESGO DIARIO
+//====================================================
+
+var int   tradesToday    = 0
+var float dayStartEquity = na
+var int   lastDay        = na
+
+newDay = na(lastDay) or dayofmonth != lastDay
+if newDay
+    lastDay        := dayofmonth
+    tradesToday    := 0
+    dayStartEquity := strategy.equity
+
+dailyLossHit   = dailyLossLimitPct > 0 and strategy.equity <= dayStartEquity * (1 - dailyLossLimitPct / 100)
+tradesLimitHit = maxTradesPerDay > 0 and tradesToday >= maxTradesPerDay
+
+canTrade = not dailyLossHit and not tradesLimitHit and inKillZone
+
+
+//====================================================
+// MÁQUINA DE ESTADOS PO3
+// El sweep+rechazo "arma" el setup; la estructura en 5m
+// puede confirmar varias velas después (no obligatoriamente
+// en la misma vela), dentro de una ventana limitada.
+//====================================================
+
+var bool shortArmed    = false
+var bool longArmed     = false
+var int  shortArmedBar = na
+var int  longArmedBar  = na
+
+if newH4Range
+    shortArmed := false
+    longArmed  := false
+
+if po3Short and not shortArmed and strategy.position_size == 0
+    shortArmed    := true
+    shortArmedBar := bar_index
+
+if po3Long and not longArmed and strategy.position_size == 0
+    longArmed    := true
+    longArmedBar := bar_index
+
+// Expira si tarda demasiado en confirmar.
+if shortArmed and bar_index - shortArmedBar > maxConfirmBars
+    shortArmed := false
+if longArmed and bar_index - longArmedBar > maxConfirmBars
+    longArmed := false
+
+// Invalida si el precio rompe con fuerza más allá del sweep
+// (deja de ser una manipulación y pasa a ser continuación real).
+if shortArmed and close > h4High + atr * invalidateATR
+    shortArmed := false
+if longArmed and close < h4Low - atr * invalidateATR
+    longArmed := false
+
+
+//====================================================
+// CONFIRMACIÓN FINAL
+//====================================================
+
+shortSignal = shortArmed and mssDown and strategy.position_size == 0 and canTrade
+longSignal  = longArmed  and mssUp   and strategy.position_size == 0 and canTrade
+
+
+//====================================================
+// STOP / RIESGO / OBJETIVOS (snapshot al momento de la señal)
+//====================================================
+
+longSLRaw  = math.min(low, h4Low)
+shortSLRaw = math.max(high, h4High)
+
+capital   = strategy.equity
+riskMoney = capital * riskPercent / 100
+
+longRiskRaw  = close - longSLRaw
+shortRiskRaw = shortSLRaw - close
+
+longTP1Raw  = close + longRiskRaw  * tp1RR
+shortTP1Raw = close - shortRiskRaw * tp1RR
+
+longStructTargetRaw  = h4High
+shortStructTargetRaw = h4Low
+
+longStructRR  = longRiskRaw  > 0 ? (longStructTargetRaw - close)  / longRiskRaw  : 0.0
+shortStructRR = shortRiskRaw > 0 ? (close - shortStructTargetRaw) / shortRiskRaw : 0.0
+
+// El RR mínimo exigido nunca puede ser menor que tp1RR: si lo fuera,
+// el objetivo estructural del runner podría quedar más cerca que el
+// propio TP1, y el runner cerraría antes de alcanzarlo.
+effectiveMinRunnerRR = math.max(minRunnerRR, tp1RR)
+
+minRiskDistance = atr * minRiskATR
+
+validLongRisk  = longRiskRaw  > math.max(syminfo.mintick, minRiskDistance) and longRiskRaw  <= atr * maxRiskATR
+validShortRisk = shortRiskRaw > math.max(syminfo.mintick, minRiskDistance) and shortRiskRaw <= atr * maxRiskATR
+
+validLongRR  = not requireMinRunnerRR or longStructRR  >= effectiveMinRunnerRR
+validShortRR = not requireMinRunnerRR or shortStructRR >= effectiveMinRunnerRR
+
+// Tope de tamaño por apalancamiento: evita posiciones desmedidas
+// cuando la distancia de riesgo es muy pequeña frente al riesgo % pedido.
+qtyLongMaxByLeverage  = (capital * maxLeverage) / close
+qtyShortMaxByLeverage = (capital * maxLeverage) / close
+
+qtyLong  = validLongRisk  ? math.min(riskMoney / longRiskRaw,  qtyLongMaxByLeverage)  : 0.0
+qtyShort = validShortRisk ? math.min(riskMoney / shortRiskRaw, qtyShortMaxByLeverage) : 0.0
+
+longEntryOK  = longSignal  and qtyLong  > 0 and validLongRR
+shortEntryOK = shortSignal and qtyShort > 0 and validShortRR
+
+
+//====================================================
+// NIVELES CONGELADOS DE LA OPERACIÓN ACTIVA
+// (se fijan una sola vez al entrar; ya no se recalculan
+// vela a vela con el close en vivo)
+//====================================================
+
+var float longSLPrice     = na
+var float longTP1Price    = na
+var float longTargetPrice = na
+var float longQtyInitial  = na
+var bool  tp1HitLong      = false
+
+var float shortSLPrice     = na
+var float shortTP1Price    = na
+var float shortTargetPrice = na
+var float shortQtyInitial  = na
+var bool  tp1HitShort      = false
+
+
+//====================================================
+// ENTRADAS
+//====================================================
+
+if longEntryOK
+    strategy.entry("PO3 Long", strategy.long, qty=qtyLong, comment="PO3 Long")
+    longSLPrice     := longSLRaw
+    longTP1Price    := longTP1Raw
+    longTargetPrice := longStructTargetRaw
+    longQtyInitial  := qtyLong
+    tp1HitLong      := false
+    longArmed       := false
+    tradesToday     := tradesToday + 1
+
+if shortEntryOK
+    strategy.entry("PO3 Short", strategy.short, qty=qtyShort, comment="PO3 Short")
+    shortSLPrice     := shortSLRaw
+    shortTP1Price    := shortTP1Raw
+    shortTargetPrice := shortStructTargetRaw
+    shortQtyInitial  := qtyShort
+    tp1HitShort      := false
+    shortArmed       := false
+    tradesToday      := tradesToday + 1
+
+
+//====================================================
+// DETECCIÓN DE TP1 EJECUTADO (para mover a breakeven)
+//====================================================
+
+if strategy.position_size > 0 and not na(longQtyInitial) and strategy.position_size < longQtyInitial - syminfo.mintick
+    tp1HitLong := true
+
+if strategy.position_size < 0 and not na(shortQtyInitial) and math.abs(strategy.position_size) < shortQtyInitial - syminfo.mintick
+    tp1HitShort := true
+
+if strategy.position_size == 0
+    tp1HitLong      := false
+    tp1HitShort     := false
+    longQtyInitial  := na
+    shortQtyInitial := na
+
+
+//====================================================
+// STOP DEL RUNNER: breakeven tras TP1 + trailing
+// estructural opcional (nunca afloja el stop)
+//====================================================
+
+var float trailStopLong  = na
+var float trailStopShort = na
+
+if strategy.position_size > 0
+    beLong = useBreakeven and tp1HitLong ? strategy.position_avg_price : longSLPrice
+    candidateLong = tp1HitLong and useStructTrail ? math.max(beLong, previousLow) : beLong
+    trailStopLong := na(trailStopLong) ? candidateLong : math.max(trailStopLong, candidateLong)
+else
+    trailStopLong := na
+
+if strategy.position_size < 0
+    beShort = useBreakeven and tp1HitShort ? strategy.position_avg_price : shortSLPrice
+    candidateShort = tp1HitShort and useStructTrail ? math.min(beShort, previousHigh) : beShort
+    trailStopShort := na(trailStopShort) ? candidateShort : math.min(trailStopShort, candidateShort)
+else
+    trailStopShort := na
+
+
+//====================================================
+// GESTIÓN LONG / SHORT
+//====================================================
+
+if strategy.position_size > 0
+    strategy.exit("TP1 Long", from_entry="PO3 Long", stop=trailStopLong, limit=longTP1Price, qty_percent=tp1Percent)
+    strategy.exit("Runner Long", from_entry="PO3 Long", stop=trailStopLong, limit=longTargetPrice, qty_percent=100 - tp1Percent)
+
+if strategy.position_size < 0
+    strategy.exit("TP1 Short", from_entry="PO3 Short", stop=trailStopShort, limit=shortTP1Price, qty_percent=tp1Percent)
+    strategy.exit("Runner Short", from_entry="PO3 Short", stop=trailStopShort, limit=shortTargetPrice, qty_percent=100 - tp1Percent)
+
+
+//====================================================
+// GESTIÓN ESTRUCTURAL DEL RUNNER
+// Si aparece ruptura estructural contraria, cerramos toda la
+// posición restante. OJO: a diferencia de strategy.exit(), el
+// qty_percent de strategy.close() es un % de la posición ABIERTA
+// actual, no de la cantidad de entrada — usar 100-tp1Percent aquí
+// (como en v2) deja huérfano un 25% de la posición tras el TP1.
+//====================================================
+
+if strategy.position_size > 0 and mssDown
+    strategy.close("PO3 Long", qty_percent=100, comment="5m Structure Exit")
+
+if strategy.position_size < 0 and mssUp
+    strategy.close("PO3 Short", qty_percent=100, comment="5m Structure Exit")
+
+
+//====================================================
+// VISUALIZACIÓN DE NIVELES
+//====================================================
+
+plot(showMonthly ? mHigh : na, "Monthly High", color=color.orange, linewidth=3)
+plot(showMonthly ? mLow  : na, "Monthly Low",  color=color.orange, linewidth=3)
+
+plot(showWeekly ? wHigh : na, "Weekly High", color=color.yellow, linewidth=2)
+plot(showWeekly ? wLow  : na, "Weekly Low",  color=color.yellow, linewidth=2)
+
+plot(showDaily ? dHigh : na, "Daily High", color=color.red, linewidth=2)
+plot(showDaily ? dLow  : na, "Daily Low",  color=color.red, linewidth=2)
+
+plot(show4H ? h4High : na, "4H High", color=color.rgb(218, 165, 32), linewidth=2)
+plot(show4H ? h4Low  : na, "4H Low",  color=color.rgb(218, 165, 32), linewidth=2)
+plot(show4H ? h4Mid  : na, "4H 50%", color=color.new(color.rgb(218, 165, 32), 50), linewidth=1, style=plot.style_dashed)
+
+
+//====================================================
+// SEÑALES
+//====================================================
+
+plotshape(showSignals and shortSignal, title="PO3 Short", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="PO3 S")
+plotshape(showSignals and longSignal,  title="PO3 Long",  style=shape.triangleup,   location=location.belowbar, color=color.lime, size=size.small, text="PO3 L")
+
+plotshape(showArmed and shortArmed and not shortSignal, title="Armado Short", style=shape.diamond, location=location.abovebar, color=color.new(color.red, 60), size=size.tiny)
+plotshape(showArmed and longArmed  and not longSignal,  title="Armado Long",  style=shape.diamond, location=location.belowbar, color=color.new(color.lime, 60), size=size.tiny)
+
+
+//====================================================
+// ALERTAS
+//====================================================
+
+alertcondition(longSignal, title="PO3 Long", message="PO3 LONG confirmado: Sweep 4H + rechazo + estructura 5m (ventana de confirmación).")
+alertcondition(shortSignal, title="PO3 Short", message="PO3 SHORT confirmado: Sweep 4H + rechazo + estructura 5m (ventana de confirmación).")
