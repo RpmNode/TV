@@ -74,6 +74,7 @@ pivotLeftBars          = input.int(3, "Pivote 5m: velas izquierda", minval=1)
 pivotRightBars         = input.int(3, "Pivote 5m: velas derecha", minval=1)
 maxPivots              = input.int(15, "Máx. pivotes internos almacenados", minval=5, maxval=50)
 useInternalLiquidityTP = input.bool(true, "Usar liquidez interna como TP1 (si existe)")
+minPivotTP1RR          = input.float(0.5, "RR mínimo para usar liquidez interna como TP1", step=0.1, minval=0.1)
 
 // --- Estructura de seguridad
 structureLength = input.int(3, "Estructura 5m (salida de seguridad)", minval=2, maxval=10)
@@ -185,14 +186,12 @@ newRange = rangeHigh != rangeHigh[1] or rangeLow != rangeLow[1]
 sweepHigh = high > rangeHigh + atr * sweepBufferATR
 sweepLow  = low  < rangeLow  - atr * sweepBufferATR
 
-po3Short =
-     sweepHigh and
+po3Short = sweepHigh and
      (not requireRangeRejection or close < rangeHigh) and
      (not requireDailyBias or dailyBear) and
      (not requireWeeklyAlign or weeklyBear)
 
-po3Long =
-     sweepLow and
+po3Long = sweepLow and
      (not requireRangeRejection or close > rangeLow) and
      (not requireDailyBias or dailyBull) and
      (not requireWeeklyAlign or weeklyBull)
@@ -273,6 +272,12 @@ if not na(pl)
     if array.size(pivotLows) > maxPivots
         array.shift(pivotLows)
 
+// Candidatos de OB calculados a nivel global cada vela (barato: lookback
+// acotado a obLookback) para evitar desestructurar tuplas dentro de un
+// bloque `if` anidado.
+[bearishObHi, bearishObLo] = findBearishOB(obLookback)
+[bullishObHi, bullishObLo] = findBullishOB(obLookback)
+
 
 //====================================================
 // MÁQUINA DE ESTADOS PO3 -> TURTLE SOUP -> OB -> ENTRADA
@@ -349,29 +354,25 @@ if shortWaitingOB and bar_index - shortWaitingOBBar > obSearchMaxBars
     shortWaitingOB := false
 
 // --- Paso 3: aparición del Order Block tras el displacement.
-if longWaitingOB and bullishDisplacement
-    [hi, lo] = findBearishOB(obLookback)
-    if not na(hi)
-        longObHigh    := hi
-        longObLow     := lo
-        longWaitingOB := false
-        longObPending := true
-        longObBar     := bar_index
-        if not na(longObBox)
-            box.delete(longObBox)
-        longObBox := showOB ? box.new(bar_index, hi, bar_index + obMaxAgeBars, lo, border_color=color.lime, bgcolor=color.new(color.lime, 85), extend=extend.none) : na
+if longWaitingOB and bullishDisplacement and not na(bearishObHi)
+    longObHigh    := bearishObHi
+    longObLow     := bearishObLo
+    longWaitingOB := false
+    longObPending := true
+    longObBar     := bar_index
+    if not na(longObBox)
+        box.delete(longObBox)
+    longObBox := showOB ? box.new(bar_index, bearishObHi, bar_index + obMaxAgeBars, bearishObLo, border_color=color.lime, bgcolor=color.new(color.lime, 85), extend=extend.none) : na
 
-if shortWaitingOB and bearishDisplacement
-    [hi, lo] = findBullishOB(obLookback)
-    if not na(hi)
-        shortObHigh    := hi
-        shortObLow     := lo
-        shortWaitingOB := false
-        shortObPending := true
-        shortObBar     := bar_index
-        if not na(shortObBox)
-            box.delete(shortObBox)
-        shortObBox := showOB ? box.new(bar_index, hi, bar_index + obMaxAgeBars, lo, border_color=color.red, bgcolor=color.new(color.red, 85), extend=extend.none) : na
+if shortWaitingOB and bearishDisplacement and not na(bullishObHi)
+    shortObHigh    := bullishObHi
+    shortObLow     := bullishObLo
+    shortWaitingOB := false
+    shortObPending := true
+    shortObBar     := bar_index
+    if not na(shortObBox)
+        box.delete(shortObBox)
+    shortObBox := showOB ? box.new(bar_index, bullishObHi, bar_index + obMaxAgeBars, bullishObLo, border_color=color.red, bgcolor=color.new(color.red, 85), extend=extend.none) : na
 
 // --- Paso 4: expiración / invalidación del OB pendiente.
 if longObPending and bar_index - longObBar > obMaxAgeBars
@@ -385,8 +386,11 @@ if shortObPending and close > shortObHigh
     shortObPending := false
 
 // --- Paso 5: tap del OB -> señal de entrada.
-longTap  = longObPending  and low  <= longObHigh and close > longObLow
-shortTap = shortObPending and high >= shortObLow  and close < shortObHigh
+// bar_index > obBar exige que el reingreso ocurra en una vela POSTERIOR
+// a la de creación del OB (si no, la propia vela de displacement casi
+// siempre cumple el tap y la entrada se dispara sin retest real).
+longTap  = longObPending  and bar_index > longObBar  and low  <= longObHigh and close > longObLow
+shortTap = shortObPending and bar_index > shortObBar and high >= shortObLow  and close < shortObHigh
 
 longSignal  = longTap  and strategy.position_size == 0 and canTrade
 shortSignal = shortTap and strategy.position_size == 0 and canTrade
@@ -416,8 +420,11 @@ shortTP1Fallback = close - shortRiskRaw * tp1RR
 longTargetRaw  = rangeHigh
 shortTargetRaw = rangeLow
 
-longTP1Raw  = (not na(longPivotTP)  and longPivotTP  < longTargetRaw  and longPivotTP  > close) ? longPivotTP  : longTP1Fallback
-shortTP1Raw = (not na(shortPivotTP) and shortPivotTP > shortTargetRaw and shortPivotTP < close) ? shortPivotTP : shortTP1Fallback
+// La liquidez interna solo se usa como TP1 si además queda a una
+// distancia razonable (>= minPivotTP1RR * riesgo); si está demasiado
+// pegada a la entrada, cae al RR fijo de respaldo.
+longTP1Raw  = (not na(longPivotTP)  and longPivotTP  < longTargetRaw  and longPivotTP  > close and (longPivotTP - close)  >= longRiskRaw  * minPivotTP1RR) ? longPivotTP  : longTP1Fallback
+shortTP1Raw = (not na(shortPivotTP) and shortPivotTP > shortTargetRaw and shortPivotTP < close and (close - shortPivotTP) >= shortRiskRaw * minPivotTP1RR) ? shortPivotTP : shortTP1Fallback
 
 longStructRR  = longRiskRaw  > 0 ? (longTargetRaw  - close) / longRiskRaw  : 0.0
 shortStructRR = shortRiskRaw > 0 ? (close - shortTargetRaw) / shortRiskRaw : 0.0
@@ -477,6 +484,11 @@ if longEntryOK
     tp1HitLong      := false
     longObPending   := false
     tradesToday     := tradesToday + 1
+    // Protección inmediata: no esperar a la vela siguiente para tener
+    // stop/objetivos en el mercado (calc_on_order_fills los reemitirá
+    // con el trailStop ya calculado en cuanto la posición esté abierta).
+    strategy.exit("TP1 Long", from_entry="PO3 Long", stop=longSLRaw, limit=longTP1Raw, qty_percent=tp1Percent)
+    strategy.exit("Runner Long", from_entry="PO3 Long", stop=longSLRaw, limit=longTargetRaw, qty_percent=100 - tp1Percent)
 
 if shortEntryOK
     strategy.entry("PO3 Short", strategy.short, qty=qtyShort, comment="PO3 Short")
@@ -487,19 +499,32 @@ if shortEntryOK
     tp1HitShort      := false
     shortObPending   := false
     tradesToday      := tradesToday + 1
+    strategy.exit("TP1 Short", from_entry="PO3 Short", stop=shortSLRaw, limit=shortTP1Raw, qty_percent=tp1Percent)
+    strategy.exit("Runner Short", from_entry="PO3 Short", stop=shortSLRaw, limit=shortTargetRaw, qty_percent=100 - tp1Percent)
 
 
 //====================================================
 // DETECCIÓN DE TP1 EJECUTADO (para mover a breakeven)
 //====================================================
 
-if strategy.position_size > 0 and not na(longQtyInitial) and strategy.position_size < longQtyInitial - syminfo.mintick
+// Tolerancia relativa (0.1% de la cantidad inicial) en vez de
+// syminfo.mintick (que es un incremento de PRECIO, no de cantidad).
+longQtyTol  = not na(longQtyInitial)  ? longQtyInitial  * 0.001 : na
+shortQtyTol = not na(shortQtyInitial) ? shortQtyInitial * 0.001 : na
+
+if strategy.position_size > 0 and not na(longQtyInitial) and strategy.position_size < longQtyInitial - longQtyTol
     tp1HitLong := true
 
-if strategy.position_size < 0 and not na(shortQtyInitial) and math.abs(strategy.position_size) < shortQtyInitial - syminfo.mintick
+if strategy.position_size < 0 and not na(shortQtyInitial) and math.abs(strategy.position_size) < shortQtyInitial - shortQtyTol
     tp1HitShort := true
 
-if strategy.position_size == 0
+// No resetear en la propia vela de entrada: la orden recién enviada
+// todavía no rellenó (fill al open de la vela siguiente con
+// calc_on_every_tick=false), así que strategy.position_size sigue en 0
+// aquí y un reset incondicional borraría longQtyInitial/shortQtyInitial
+// que acabamos de fijar arriba, dejando tp1HitLong/tp1HitShort
+// permanentemente en false (breakeven y trailing nunca se activarían).
+if strategy.position_size == 0 and not longEntryOK and not shortEntryOK
     tp1HitLong      := false
     tp1HitShort     := false
     longQtyInitial  := na
