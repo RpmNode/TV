@@ -1,0 +1,583 @@
+//@version=5
+// ====================================================================
+// BTC/USDC - PO3 + CRT + Liquidez Interna ICT + Turtle Soup + OB v1.0
+//
+// Secuencia operativa:
+//   1) PO3 (manipulación): barrido de un extremo del rango elegido
+//      (4H / 1D / 1S / 1M).
+//   2) CRT (expansión): el objetivo final es el lado OPUESTO de ese
+//      mismo rango.
+//   3) Confirmación anidada en 5m: turtle soup sobre liquidez interna
+//      (barrido + rechazo de un swing reciente en 5m).
+//   4) Confirmación final: aparición de un Order Block tras el turtle
+//      soup y reingreso ("tap") del precio a esa zona -> entrada.
+//   5) Gestión: TP1 en la liquidez interna (pivote) más cercana si
+//      existe (si no, RR fijo de respaldo); runner a breakeven y
+//      trailing con pivotes internos hasta el objetivo CRT.
+//
+// NOTA: está construido a partir de la descripción pública de PO3
+// (Power of Three / AMD), CRT (Candle Range Theory) y los conceptos
+// ICT de liquidez interna, turtle soup y Order Block. No tengo acceso
+// al video de Cluti fx citado como referencia: revisar contra esa
+// fuente y ajustar sobre todo la definición de OB, el lookback de
+// liquidez interna y las ventanas de confirmación si difieren.
+// ====================================================================
+
+strategy("BTC/USDC - PO3 CRT + Internal Liquidity + OB v1.0",
+     overlay=true,
+     initial_capital=100000,
+     pyramiding=0,
+     default_qty_type=strategy.fixed,
+     commission_type=strategy.commission.percent,
+     commission_value=0.04,
+     calc_on_order_fills=true,
+     calc_on_every_tick=false)
+
+//====================================================
+// INPUTS
+//====================================================
+
+// --- Rango operable (PO3 / CRT)
+rangeTF = input.string("240", "Timeframe del rango (PO3 / CRT)", options=["240", "D", "W", "M"])
+
+// --- Riesgo
+riskPercent        = input.float(1.0, "Riesgo por operación (%)", step=0.1, minval=0.1)
+tp1RR              = input.float(2.0, "TP1 RR (respaldo si no hay liquidez interna)", step=0.25, minval=0.5)
+tp1Percent         = input.float(50.0, "Cerrar en TP1 (%)", step=5, minval=0, maxval=100)
+minRiskATR         = input.float(0.15, "Riesgo mínimo permitido (x ATR)", step=0.05, minval=0.01)
+maxRiskATR         = input.float(3.0, "Riesgo máximo permitido (x ATR)", step=0.5, minval=0.5)
+maxLeverage        = input.float(3.0, "Apalancamiento máximo (x equity)", step=0.5, minval=0.5)
+requireMinRunnerRR = input.bool(true, "Exigir RR estructural mínimo para el runner")
+minRunnerRR        = input.float(2.0, "RR mínimo del objetivo CRT", step=0.25, minval=0.5)
+slBufferATR        = input.float(0.10, "Buffer del SL bajo sweep/OB (x ATR)", step=0.05, minval=0)
+
+// --- PO3 (manipulación del rango)
+sweepBufferATR        = input.float(0.05, "Buffer Sweep del rango (x ATR)", step=0.01)
+requireRangeRejection = input.bool(true, "Exigir rechazo de vuelta al rango")
+requireDailyBias      = input.bool(true, "Exigir BIAS Daily")
+requireWeeklyAlign    = input.bool(false, "Exigir alineación Weekly")
+invalidateATR         = input.float(0.30, "Invalidar manipulación si excede (x ATR)", step=0.05, minval=0.05)
+maxConfirmBars        = input.int(48, "Máx. velas 5m para turtle soup interno", minval=1)
+
+// --- Turtle soup interno (liquidez interna 5m)
+tsLookback  = input.int(10, "Lookback liquidez interna 5m", minval=3)
+tsBufferATR = input.float(0.05, "Buffer sweep interno 5m (x ATR)", step=0.01)
+
+// --- Order Block (5m)
+obDisplacementATR = input.float(0.8, "Displacement mínimo para OB (x ATR)", step=0.1, minval=0.1)
+obLookback        = input.int(8, "Velas atrás para buscar el OB", minval=1, maxval=20)
+obSearchMaxBars   = input.int(24, "Máx. velas esperando que aparezca el OB", minval=1)
+obMaxAgeBars      = input.int(48, "Máx. velas esperando el retest del OB", minval=1)
+
+// --- Liquidez interna ICT (gestión vía pivotes 5m)
+pivotLeftBars          = input.int(3, "Pivote 5m: velas izquierda", minval=1)
+pivotRightBars         = input.int(3, "Pivote 5m: velas derecha", minval=1)
+maxPivots              = input.int(15, "Máx. pivotes internos almacenados", minval=5, maxval=50)
+useInternalLiquidityTP = input.bool(true, "Usar liquidez interna como TP1 (si existe)")
+
+// --- Estructura de seguridad
+structureLength = input.int(3, "Estructura 5m (salida de seguridad)", minval=2, maxval=10)
+
+// --- Gestión del runner
+useBreakeven   = input.bool(true, "Mover runner a breakeven tras TP1")
+useStructTrail = input.bool(true, "Trailing del runner con pivotes internos")
+
+// --- Filtro de sesión
+useSessionFilter = input.bool(false, "Filtrar por sesión (Kill Zone)")
+killZoneSession  = input.session("0700-1030", "Sesión operativa (hora del gráfico)")
+
+// --- Control de riesgo diario
+maxTradesPerDay   = input.int(0, "Máx. operaciones por día (0 = sin límite)", minval=0)
+dailyLossLimitPct = input.float(0.0, "Límite de pérdida diaria % (0 = sin límite)", step=0.5, minval=0)
+
+// --- Visual
+showRange             = input.bool(true, "Mostrar rango PO3/CRT")
+showOB                = input.bool(true, "Mostrar zonas de Order Block")
+showInternalLiquidity = input.bool(true, "Mostrar pivotes de liquidez interna")
+showSignals           = input.bool(true, "Mostrar señales")
+showArmed             = input.bool(true, "Mostrar estados intermedios (armado / esperando OB)")
+
+
+//====================================================
+// FUNCIONES AUXILIARES
+//====================================================
+
+nearLevel(price, level, tolAtr, atrVal) =>
+    math.abs(price - level) <= atrVal * tolAtr
+
+// Último candle bajista antes del displacement (OB alcista).
+findBearishOB(lookback) =>
+    float hi = na
+    float lo = na
+    for i = 1 to lookback
+        if na(hi) and close[i] < open[i]
+            hi := high[i]
+            lo := low[i]
+    [hi, lo]
+
+// Último candle alcista antes del displacement (OB bajista).
+findBullishOB(lookback) =>
+    float hi = na
+    float lo = na
+    for i = 1 to lookback
+        if na(hi) and close[i] > open[i]
+            hi := high[i]
+            lo := low[i]
+    [hi, lo]
+
+nearestPivotAbove(arr, price) =>
+    float best = na
+    if array.size(arr) > 0
+        for i = 0 to array.size(arr) - 1
+            v = array.get(arr, i)
+            if v > price and (na(best) or v < best)
+                best := v
+    best
+
+nearestPivotBelow(arr, price) =>
+    float best = na
+    if array.size(arr) > 0
+        for i = 0 to array.size(arr) - 1
+            v = array.get(arr, i)
+            if v < price and (na(best) or v > best)
+                best := v
+    best
+
+
+//====================================================
+// ATR
+//====================================================
+
+atr = ta.atr(14)
+
+
+//====================================================
+// RANGO PO3 / CRT (seleccionable) + BIAS
+//====================================================
+
+rangeHigh = request.security(syminfo.tickerid, rangeTF, high[1], lookahead=barmerge.lookahead_off)
+rangeLow  = request.security(syminfo.tickerid, rangeTF, low[1],  lookahead=barmerge.lookahead_off)
+
+dOpen  = request.security(syminfo.tickerid, "D", open[1],  lookahead=barmerge.lookahead_off)
+dClose = request.security(syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_off)
+wOpen  = request.security(syminfo.tickerid, "W", open[1],  lookahead=barmerge.lookahead_off)
+wClose = request.security(syminfo.tickerid, "W", close[1], lookahead=barmerge.lookahead_off)
+
+dailyBull  = dClose > dOpen
+dailyBear  = dClose < dOpen
+weeklyBull = wClose > wOpen
+weeklyBear = wClose < wOpen
+
+// Si el rango elegido coincide con la temporalidad del filtro de bias,
+// exigirlo es redundante (compara la vela contra sí misma). Avisar al
+// usuario vía este comentario: desactivar el filtro correspondiente si
+// rangeTF == "D" (Daily) o rangeTF == "W" (Weekly).
+
+// Nuevo rango detectado -> cualquier setup en curso sobre el rango
+// anterior queda obsoleto.
+newRange = rangeHigh != rangeHigh[1] or rangeLow != rangeLow[1]
+
+
+//====================================================
+// PO3: MANIPULACIÓN DEL RANGO
+//====================================================
+
+sweepHigh = high > rangeHigh + atr * sweepBufferATR
+sweepLow  = low  < rangeLow  - atr * sweepBufferATR
+
+po3Short =
+     sweepHigh and
+     (not requireRangeRejection or close < rangeHigh) and
+     (not requireDailyBias or dailyBear) and
+     (not requireWeeklyAlign or weeklyBear)
+
+po3Long =
+     sweepLow and
+     (not requireRangeRejection or close > rangeLow) and
+     (not requireDailyBias or dailyBull) and
+     (not requireWeeklyAlign or weeklyBull)
+
+
+//====================================================
+// TURTLE SOUP INTERNO (liquidez interna 5m)
+//====================================================
+
+tsSwingLow  = ta.lowest(low[1], tsLookback)
+tsSwingHigh = ta.highest(high[1], tsLookback)
+
+tsSweepLow  = low  < tsSwingLow  - atr * tsBufferATR
+tsSweepHigh = high > tsSwingHigh + atr * tsBufferATR
+
+tsRejectLow  = tsSweepLow  and close > tsSwingLow
+tsRejectHigh = tsSweepHigh and close < tsSwingHigh
+
+
+//====================================================
+// ESTRUCTURA 5M (para displacement y salida de seguridad)
+//====================================================
+
+previousLow  = ta.lowest(low[1], structureLength)
+previousHigh = ta.highest(high[1], structureLength)
+
+mssDown = close < previousLow
+mssUp   = close > previousHigh
+
+bullishDisplacement = (close - open) >= atr * obDisplacementATR and close > previousHigh
+bearishDisplacement = (open - close) >= atr * obDisplacementATR and close < previousLow
+
+
+//====================================================
+// FILTRO DE SESIÓN
+//====================================================
+
+inKillZone = not useSessionFilter or not na(time(timeframe.period, killZoneSession))
+
+
+//====================================================
+// CONTROL DE RIESGO DIARIO
+//====================================================
+
+var int   tradesToday    = 0
+var float dayStartEquity = na
+var int   lastDay        = na
+
+newDay = na(lastDay) or dayofmonth != lastDay
+if newDay
+    lastDay        := dayofmonth
+    tradesToday    := 0
+    dayStartEquity := strategy.equity
+
+dailyLossHit   = dailyLossLimitPct > 0 and strategy.equity <= dayStartEquity * (1 - dailyLossLimitPct / 100)
+tradesLimitHit = maxTradesPerDay > 0 and tradesToday >= maxTradesPerDay
+
+canTrade = not dailyLossHit and not tradesLimitHit and inKillZone
+
+
+//====================================================
+// LIQUIDEZ INTERNA (pivotes 5m) - para gestión
+//====================================================
+
+ph = ta.pivothigh(high, pivotLeftBars, pivotRightBars)
+pl = ta.pivotlow(low, pivotLeftBars, pivotRightBars)
+
+var array<float> pivotHighs = array.new_float(0)
+var array<float> pivotLows  = array.new_float(0)
+
+if not na(ph)
+    array.push(pivotHighs, ph)
+    if array.size(pivotHighs) > maxPivots
+        array.shift(pivotHighs)
+
+if not na(pl)
+    array.push(pivotLows, pl)
+    if array.size(pivotLows) > maxPivots
+        array.shift(pivotLows)
+
+
+//====================================================
+// MÁQUINA DE ESTADOS PO3 -> TURTLE SOUP -> OB -> ENTRADA
+//====================================================
+
+var bool  shortArmed        = false
+var bool  longArmed         = false
+var int   shortArmedBar     = na
+var int   longArmedBar      = na
+
+var bool  shortWaitingOB      = false
+var bool  longWaitingOB       = false
+var int   shortWaitingOBBar   = na
+var int   longWaitingOBBar    = na
+var float shortMicroSweepHigh = na
+var float longMicroSweepLow   = na
+
+var bool  shortObPending = false
+var bool  longObPending  = false
+var float shortObHigh    = na
+var float shortObLow     = na
+var float longObHigh     = na
+var float longObLow      = na
+var int   shortObBar     = na
+var int   longObBar      = na
+
+var box shortObBox = na
+var box longObBox  = na
+
+// --- Rango nuevo: se descarta cualquier setup sobre el rango anterior.
+if newRange
+    shortArmed     := false
+    longArmed      := false
+    shortWaitingOB := false
+    longWaitingOB  := false
+    shortObPending := false
+    longObPending  := false
+
+// --- Paso 1: armar tras la manipulación PO3 del rango.
+if po3Short and not shortArmed and strategy.position_size == 0 and not shortWaitingOB and not shortObPending
+    shortArmed    := true
+    shortArmedBar := bar_index
+
+if po3Long and not longArmed and strategy.position_size == 0 and not longWaitingOB and not longObPending
+    longArmed    := true
+    longArmedBar := bar_index
+
+if shortArmed and bar_index - shortArmedBar > maxConfirmBars
+    shortArmed := false
+if longArmed and bar_index - longArmedBar > maxConfirmBars
+    longArmed := false
+
+if shortArmed and close > rangeHigh + atr * invalidateATR
+    shortArmed := false
+if longArmed and close < rangeLow - atr * invalidateATR
+    longArmed := false
+
+// --- Paso 2: turtle soup interno en 5m (nested dentro de la ventana armada).
+if longArmed and tsRejectLow
+    longArmed          := false
+    longWaitingOB       := true
+    longWaitingOBBar    := bar_index
+    longMicroSweepLow   := low
+
+if shortArmed and tsRejectHigh
+    shortArmed           := false
+    shortWaitingOB        := true
+    shortWaitingOBBar     := bar_index
+    shortMicroSweepHigh   := high
+
+if longWaitingOB and bar_index - longWaitingOBBar > obSearchMaxBars
+    longWaitingOB := false
+if shortWaitingOB and bar_index - shortWaitingOBBar > obSearchMaxBars
+    shortWaitingOB := false
+
+// --- Paso 3: aparición del Order Block tras el displacement.
+if longWaitingOB and bullishDisplacement
+    [hi, lo] = findBearishOB(obLookback)
+    if not na(hi)
+        longObHigh    := hi
+        longObLow     := lo
+        longWaitingOB := false
+        longObPending := true
+        longObBar     := bar_index
+        if not na(longObBox)
+            box.delete(longObBox)
+        longObBox := showOB ? box.new(bar_index, hi, bar_index + obMaxAgeBars, lo, border_color=color.lime, bgcolor=color.new(color.lime, 85), extend=extend.none) : na
+
+if shortWaitingOB and bearishDisplacement
+    [hi, lo] = findBullishOB(obLookback)
+    if not na(hi)
+        shortObHigh    := hi
+        shortObLow     := lo
+        shortWaitingOB := false
+        shortObPending := true
+        shortObBar     := bar_index
+        if not na(shortObBox)
+            box.delete(shortObBox)
+        shortObBox := showOB ? box.new(bar_index, hi, bar_index + obMaxAgeBars, lo, border_color=color.red, bgcolor=color.new(color.red, 85), extend=extend.none) : na
+
+// --- Paso 4: expiración / invalidación del OB pendiente.
+if longObPending and bar_index - longObBar > obMaxAgeBars
+    longObPending := false
+if shortObPending and bar_index - shortObBar > obMaxAgeBars
+    shortObPending := false
+
+if longObPending and close < longObLow
+    longObPending := false
+if shortObPending and close > shortObHigh
+    shortObPending := false
+
+// --- Paso 5: tap del OB -> señal de entrada.
+longTap  = longObPending  and low  <= longObHigh and close > longObLow
+shortTap = shortObPending and high >= shortObLow  and close < shortObHigh
+
+longSignal  = longTap  and strategy.position_size == 0 and canTrade
+shortSignal = shortTap and strategy.position_size == 0 and canTrade
+
+
+//====================================================
+// STOP / RIESGO / OBJETIVOS (snapshot al momento de la señal)
+//====================================================
+
+longSLRaw  = math.min(longMicroSweepLow, longObLow)   - atr * slBufferATR
+shortSLRaw = math.max(shortMicroSweepHigh, shortObHigh) + atr * slBufferATR
+
+capital   = strategy.equity
+riskMoney = capital * riskPercent / 100
+
+longRiskRaw  = close - longSLRaw
+shortRiskRaw = shortSLRaw - close
+
+// TP1: liquidez interna (pivote) más cercana en la dirección del trade,
+// si existe y está entre la entrada y el objetivo CRT; si no, RR fijo.
+longPivotTP  = useInternalLiquidityTP ? nearestPivotAbove(pivotHighs, close) : na
+shortPivotTP = useInternalLiquidityTP ? nearestPivotBelow(pivotLows, close)  : na
+
+longTP1Fallback  = close + longRiskRaw  * tp1RR
+shortTP1Fallback = close - shortRiskRaw * tp1RR
+
+longTargetRaw  = rangeHigh
+shortTargetRaw = rangeLow
+
+longTP1Raw  = (not na(longPivotTP)  and longPivotTP  < longTargetRaw  and longPivotTP  > close) ? longPivotTP  : longTP1Fallback
+shortTP1Raw = (not na(shortPivotTP) and shortPivotTP > shortTargetRaw and shortPivotTP < close) ? shortPivotTP : shortTP1Fallback
+
+longStructRR  = longRiskRaw  > 0 ? (longTargetRaw  - close) / longRiskRaw  : 0.0
+shortStructRR = shortRiskRaw > 0 ? (close - shortTargetRaw) / shortRiskRaw : 0.0
+
+// El RR mínimo exigido nunca puede ser menor que tp1RR: si lo fuera, el
+// objetivo CRT podría quedar más cerca que el propio TP1.
+effectiveMinRunnerRR = math.max(minRunnerRR, tp1RR)
+
+minRiskDistance = atr * minRiskATR
+
+validLongRisk  = longRiskRaw  > math.max(syminfo.mintick, minRiskDistance) and longRiskRaw  <= atr * maxRiskATR
+validShortRisk = shortRiskRaw > math.max(syminfo.mintick, minRiskDistance) and shortRiskRaw <= atr * maxRiskATR
+
+validLongRR  = not requireMinRunnerRR or longStructRR  >= effectiveMinRunnerRR
+validShortRR = not requireMinRunnerRR or shortStructRR >= effectiveMinRunnerRR
+
+// Tope de tamaño por apalancamiento: evita posiciones desmedidas cuando
+// la distancia de riesgo es muy pequeña frente al riesgo % pedido.
+qtyLongMaxByLeverage  = (capital * maxLeverage) / close
+qtyShortMaxByLeverage = (capital * maxLeverage) / close
+
+qtyLong  = validLongRisk  ? math.min(riskMoney / longRiskRaw,  qtyLongMaxByLeverage)  : 0.0
+qtyShort = validShortRisk ? math.min(riskMoney / shortRiskRaw, qtyShortMaxByLeverage) : 0.0
+
+longEntryOK  = longSignal  and qtyLong  > 0 and validLongRR
+shortEntryOK = shortSignal and qtyShort > 0 and validShortRR
+
+
+//====================================================
+// NIVELES CONGELADOS DE LA OPERACIÓN ACTIVA
+// (se fijan una sola vez al entrar; no se recalculan vela a vela)
+//====================================================
+
+var float longSLPrice     = na
+var float longTP1Price    = na
+var float longTargetPrice = na
+var float longQtyInitial  = na
+var bool  tp1HitLong      = false
+
+var float shortSLPrice     = na
+var float shortTP1Price    = na
+var float shortTargetPrice = na
+var float shortQtyInitial  = na
+var bool  tp1HitShort      = false
+
+
+//====================================================
+// ENTRADAS
+//====================================================
+
+if longEntryOK
+    strategy.entry("PO3 Long", strategy.long, qty=qtyLong, comment="PO3 Long")
+    longSLPrice     := longSLRaw
+    longTP1Price    := longTP1Raw
+    longTargetPrice := longTargetRaw
+    longQtyInitial  := qtyLong
+    tp1HitLong      := false
+    longObPending   := false
+    tradesToday     := tradesToday + 1
+
+if shortEntryOK
+    strategy.entry("PO3 Short", strategy.short, qty=qtyShort, comment="PO3 Short")
+    shortSLPrice     := shortSLRaw
+    shortTP1Price    := shortTP1Raw
+    shortTargetPrice := shortTargetRaw
+    shortQtyInitial  := qtyShort
+    tp1HitShort      := false
+    shortObPending   := false
+    tradesToday      := tradesToday + 1
+
+
+//====================================================
+// DETECCIÓN DE TP1 EJECUTADO (para mover a breakeven)
+//====================================================
+
+if strategy.position_size > 0 and not na(longQtyInitial) and strategy.position_size < longQtyInitial - syminfo.mintick
+    tp1HitLong := true
+
+if strategy.position_size < 0 and not na(shortQtyInitial) and math.abs(strategy.position_size) < shortQtyInitial - syminfo.mintick
+    tp1HitShort := true
+
+if strategy.position_size == 0
+    tp1HitLong      := false
+    tp1HitShort     := false
+    longQtyInitial  := na
+    shortQtyInitial := na
+
+
+//====================================================
+// STOP DEL RUNNER: breakeven tras TP1 + trailing con
+// liquidez interna (pivotes), nunca afloja el stop.
+//====================================================
+
+var float trailStopLong  = na
+var float trailStopShort = na
+
+if strategy.position_size > 0
+    beLong        = useBreakeven and tp1HitLong ? strategy.position_avg_price : longSLPrice
+    pivotTrailLong = nearestPivotBelow(pivotLows, close)
+    candidateLong = tp1HitLong and useStructTrail and not na(pivotTrailLong) ? math.max(beLong, pivotTrailLong) : beLong
+    trailStopLong := na(trailStopLong) ? candidateLong : math.max(trailStopLong, candidateLong)
+else
+    trailStopLong := na
+
+if strategy.position_size < 0
+    beShort        = useBreakeven and tp1HitShort ? strategy.position_avg_price : shortSLPrice
+    pivotTrailShort = nearestPivotAbove(pivotHighs, close)
+    candidateShort = tp1HitShort and useStructTrail and not na(pivotTrailShort) ? math.min(beShort, pivotTrailShort) : beShort
+    trailStopShort := na(trailStopShort) ? candidateShort : math.min(trailStopShort, candidateShort)
+else
+    trailStopShort := na
+
+
+//====================================================
+// GESTIÓN LONG / SHORT
+//====================================================
+
+if strategy.position_size > 0
+    strategy.exit("TP1 Long", from_entry="PO3 Long", stop=trailStopLong, limit=longTP1Price, qty_percent=tp1Percent)
+    strategy.exit("Runner Long", from_entry="PO3 Long", stop=trailStopLong, limit=longTargetPrice, qty_percent=100 - tp1Percent)
+
+if strategy.position_size < 0
+    strategy.exit("TP1 Short", from_entry="PO3 Short", stop=trailStopShort, limit=shortTP1Price, qty_percent=tp1Percent)
+    strategy.exit("Runner Short", from_entry="PO3 Short", stop=trailStopShort, limit=shortTargetPrice, qty_percent=100 - tp1Percent)
+
+
+//====================================================
+// SALIDA DE SEGURIDAD ESTRUCTURAL
+// Ruptura de estructura 5m contraria -> cerrar toda la posición
+// restante (qty_percent de strategy.close() es sobre la posición
+// abierta actual, no sobre la cantidad de entrada).
+//====================================================
+
+if strategy.position_size > 0 and mssDown
+    strategy.close("PO3 Long", qty_percent=100, comment="5m Structure Exit")
+
+if strategy.position_size < 0 and mssUp
+    strategy.close("PO3 Short", qty_percent=100, comment="5m Structure Exit")
+
+
+//====================================================
+// VISUALIZACIÓN
+//====================================================
+
+plot(showRange ? rangeHigh : na, "Rango High (PO3/CRT)", color=color.rgb(218, 165, 32), linewidth=2)
+plot(showRange ? rangeLow  : na, "Rango Low (PO3/CRT)",  color=color.rgb(218, 165, 32), linewidth=2)
+
+plotshape(showInternalLiquidity and not na(ph), title="Pivote interno High", style=shape.xcross, location=location.abovebar, color=color.new(color.gray, 40), size=size.tiny, offset=-pivotRightBars)
+plotshape(showInternalLiquidity and not na(pl), title="Pivote interno Low",  style=shape.xcross, location=location.belowbar, color=color.new(color.gray, 40), size=size.tiny, offset=-pivotRightBars)
+
+plotshape(showArmed and (shortArmed or shortWaitingOB) and not shortSignal, title="Short en curso", style=shape.diamond, location=location.abovebar, color=color.new(color.red, 60), size=size.tiny)
+plotshape(showArmed and (longArmed or longWaitingOB) and not longSignal,   title="Long en curso",  style=shape.diamond, location=location.belowbar, color=color.new(color.lime, 60), size=size.tiny)
+
+plotshape(showSignals and shortSignal, title="PO3 Short", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="PO3 S")
+plotshape(showSignals and longSignal,  title="PO3 Long",  style=shape.triangleup,   location=location.belowbar, color=color.lime, size=size.small, text="PO3 L")
+
+
+//====================================================
+// ALERTAS
+//====================================================
+
+alertcondition(longSignal, title="PO3 Long", message="PO3 LONG: manipulación del rango + turtle soup interno + tap de OB confirmado.")
+alertcondition(shortSignal, title="PO3 Short", message="PO3 SHORT: manipulación del rango + turtle soup interno + tap de OB confirmado.")
